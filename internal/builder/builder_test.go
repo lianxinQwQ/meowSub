@@ -456,31 +456,32 @@ func envStub(kv map[string]string) func(string) (string, bool) {
 	}
 }
 
-func TestCollectProxyEnvFromProcess(t *testing.T) {
+func TestCollectBuildEnvFromProcess(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "environment") // 不存在的文件：仅进程环境
 	env := map[string]string{
 		"http_proxy":  "http://127.0.0.1:7890",
+		"HTTP_PROXY":  "http://must-not-pass:9999",
 		"HTTPS_PROXY": "socks5://127.0.0.1:7891",
 		"no_proxy":    "localhost,127.0.0.1",
 		"ALL_PROXY":   "", // 空值视同未设置
 	}
-	got := collectProxyEnvFrom(envStub(env), f)
+	got := collectBuildEnvFrom([]string{"http_proxy", "HTTPS_PROXY", "no_proxy"}, envStub(env), f)
 	if want := "http_proxy=http://127.0.0.1:7890\nHTTPS_PROXY=socks5://127.0.0.1:7891\nno_proxy=localhost,127.0.0.1"; strings.Join(got, "\n") != want {
 		t.Fatalf("got %v\nwant %v", got, want)
 	}
 }
 
-func TestCollectProxyEnvBothCasingsIndependent(t *testing.T) {
-	got := collectProxyEnvFrom(envStub(map[string]string{
+func TestCollectBuildEnvKeepsConfiguredOrderAndCase(t *testing.T) {
+	got := collectBuildEnvFrom([]string{"HTTP_PROXY", "http_proxy"}, envStub(map[string]string{
 		"http_proxy": "http://lower:1",
 		"HTTP_PROXY": "http://upper:2",
 	}), filepath.Join(t.TempDir(), "environment"))
-	if strings.Join(got, "\n") != "http_proxy=http://lower:1\nHTTP_PROXY=http://upper:2" {
-		t.Errorf("两变体应各自独立按序输出，got %v", got)
+	if strings.Join(got, "\n") != "HTTP_PROXY=http://upper:2\nhttp_proxy=http://lower:1" {
+		t.Errorf("应按配置顺序并保持大小写输出，got %v", got)
 	}
 }
 
-func TestCollectProxyEnvFallsBackToEnvironmentFile(t *testing.T) {
+func TestCollectBuildEnvFallsBackToEnvironmentFile(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "environment")
 	os.WriteFile(f, []byte(`# 注释
@@ -489,43 +490,29 @@ LANG=zh_CN.UTF-8
 `), 0o644)
 
 	// 文件兜底保真：大写键保持大写
-	got := collectProxyEnvFrom(envStub(map[string]string{}), f)
+	got := collectBuildEnvFrom([]string{"HTTP_PROXY"}, envStub(map[string]string{}), f)
 	if strings.Join(got, ",") != "HTTP_PROXY=http://proxy.example.net:3128" {
 		t.Errorf("got %v", got)
 	}
 
 	// 进程环境优先；文件只补精确缺失的键（小写已有、大写缺 → 大写从文件补）
-	got = collectProxyEnvFrom(envStub(map[string]string{"http_proxy": "http://proc:1"}), f)
+	got = collectBuildEnvFrom([]string{"http_proxy", "HTTP_PROXY"}, envStub(map[string]string{"http_proxy": "http://proc:1"}), f)
 	if strings.Join(got, "\n") != "http_proxy=http://proc:1\nHTTP_PROXY=http://proxy.example.net:3128" {
 		t.Errorf("got %v", got)
 	}
 
 	// 进程环境的精确键不被文件覆盖（大小写都是精确匹配）
-	got = collectProxyEnvFrom(envStub(map[string]string{"HTTP_PROXY": "http://proc-up:4"}), f)
+	got = collectBuildEnvFrom([]string{"HTTP_PROXY"}, envStub(map[string]string{"HTTP_PROXY": "http://proc-up:4"}), f)
 	if strings.Join(got, ",") != "HTTP_PROXY=http://proc-up:4" {
 		t.Errorf("got %v", got)
 	}
 }
 
-func TestMaskUserinfo(t *testing.T) {
-	cases := map[string]string{
-		"http://user:secret@127.0.0.1:7890": "http://***@127.0.0.1:7890",
-		"http://127.0.0.1:7890":             "http://127.0.0.1:7890",
-		"socks5://u@host":                   "socks5://***@host",
-		"weird-no-scheme":                   "weird-no-scheme",
-	}
-	for in, want := range cases {
-		if got := maskUserinfo(in); got != want {
-			t.Errorf("mask(%s)=%s want %s", in, got, want)
-		}
-	}
-}
-
-func TestNspawnInjectsProxySetenv(t *testing.T) {
+func TestNspawnInjectsConfiguredBuildEnv(t *testing.T) {
 	base := t.TempDir()
 	r := &execx.RecordRunner{}
 	b := New(r, os.Stderr, base)
-	b.ProxyEnv = []string{"http_proxy=http://user:pw@127.0.0.1:7890"}
+	b.BuildEnv = []string{"http_proxy=http://user:pw@127.0.0.1:7890"}
 	acts := []*reconcile.Action{
 		{Type: reconcile.ActUpdateBase, Name: "arch", Path: filepath.Join(base, "arch")},
 	}
@@ -962,6 +949,89 @@ func TestAurDumpResolvesVirtualProvider(t *testing.T) {
 	}
 	if !c.Aur["mystic-theme"] {
 		t.Errorf("aur 标记错误: %v", c.Aur)
+	}
+}
+
+func TestAurExactNameWinsRegardlessOfResolverOrder(t *testing.T) {
+	// AUR 真名没有 Provides，但另有多个包提供同名虚拟依赖；无论转储是否
+	// 已被前一个软件组加载，都必须先选 AUR 真名 linuxqq。
+	aurDump := `[
+  {"Name":"seed"},
+  {"Name":"linuxqq"},
+  {"Name":"linuxqq-appimage","Provides":["linuxqq"]},
+  {"Name":"linuxqq-nt","Provides":["linuxqq"]},
+  {"Name":"linuxqq-nt-bwrap","Provides":["linuxqq"]}
+]`
+	newResolver := func() *HostResolver {
+		return &HostResolver{
+			Runner:   &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{"pacman -Si": {Out: ""}}},
+			CacheDir: t.TempDir(),
+			Fetcher: func(u string) ([]byte, error) {
+				if u == aurDumpURL {
+					return gzBytes(t, aurDump), nil
+				}
+				return nil, fmt.Errorf("unexpected url %s", u)
+			},
+		}
+	}
+	assertLinuxQQ := func(label string, c *planner.Closure, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s Resolve: %v", label, err)
+		}
+		if strings.Join(c.Pkgs, ",") != "linuxqq" {
+			t.Errorf("%s pkgs = %v, want [linuxqq]", label, c.Pkgs)
+		}
+		if !c.Aur["linuxqq"] || len(c.Aur) != 1 {
+			t.Errorf("%s aur = %v, want only linuxqq", label, c.Aur)
+		}
+	}
+
+	// 冷启动顺序：直接解析目标。
+	fresh := newResolver()
+	freshClosure, freshErr := fresh.Resolve([]string{"linuxqq"})
+	assertLinuxQQ("fresh", freshClosure, freshErr)
+
+	// 预热顺序：先解析其他 AUR 软件组，使 aurProviders 已建立，再解析目标。
+	warm := newResolver()
+	if _, err := warm.Resolve([]string{"seed"}); err != nil {
+		t.Fatalf("warmup Resolve: %v", err)
+	}
+	if got := len(warm.aurProviders["linuxqq"]); got != 3 {
+		t.Fatalf("aurProviders[linuxqq] = %d, want 3", got)
+	}
+	warmClosure, warmErr := warm.Resolve([]string{"linuxqq"})
+	assertLinuxQQ("warmed", warmClosure, warmErr)
+}
+
+func TestRepoProviderPrecedesAurCandidates(t *testing.T) {
+	// 官方仓库提供虚拟依赖时，AUR 的同名包和 AUR Provider 都不应参与选择。
+	repoDump := strings.Join([]string{
+		"Repository    : extra\nName            : app\nDepends On    : tool\n",
+		"Repository    : extra\nName            : repo-tool\nProvides       : tool\n",
+	}, "\n")
+	aurDump := `[{"Name":"tool"},{"Name":"aur-tool","Provides":["tool"]}]`
+	res := &HostResolver{
+		Runner: &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{
+			"pacman -Si": {Out: repoDump},
+		}},
+		CacheDir: t.TempDir(),
+		Fetcher: func(u string) ([]byte, error) {
+			if u == aurDumpURL {
+				return gzBytes(t, aurDump), nil
+			}
+			return nil, fmt.Errorf("unexpected url %s", u)
+		},
+	}
+	c, err := res.Resolve([]string{"app"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if strings.Join(c.Pkgs, ",") != "app,repo-tool" {
+		t.Errorf("pkgs = %v, want [app repo-tool]", c.Pkgs)
+	}
+	if len(c.Aur) != 0 {
+		t.Errorf("aur = %v, want no AUR package", c.Aur)
 	}
 }
 

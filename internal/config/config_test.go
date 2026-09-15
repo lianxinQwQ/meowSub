@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,48 @@ packages = ["visual-studio-code-bin", "cargo"]
 	if g0.Name != "code" || len(g0.Packages) != 2 || g0.Packages[1] != "cargo" {
 		// 表在 TOML 中按声明顺序出现；code 在前
 		t.Errorf("group0 = %+v", g0)
+	}
+}
+
+func TestLoadBuildEnv(t *testing.T) {
+	p := writeTmp(t, `
+base_dir = "/srv/subs"
+build_env = ["HTTP_PROXY", "CUSTOM_FLAG", "http_proxy"]
+
+[tool]
+packages = ["vim"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := strings.Join(cfg.BuildEnv, ","), "HTTP_PROXY,CUSTOM_FLAG,http_proxy"; got != want {
+		t.Fatalf("BuildEnv = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsBadBuildEnv(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"非数组", `"CUSTOM_FLAG"`},
+		{"空变量名", `["CUSTOM_FLAG", ""]`},
+		{"非法变量名", `["BAD-NAME"]`},
+		{"变量名不能以数字开头", `["1BAD"]`},
+		{"重复变量名", `["CUSTOM_FLAG", "CUSTOM_FLAG"]`},
+	}
+	for _, tc := range cases {
+		p := writeTmp(t, fmt.Sprintf(`
+base_dir = "/srv/subs"
+build_env = %s
+
+[tool]
+packages = ["vim"]
+`, tc.value))
+		if _, err := Load(p); err == nil {
+			t.Errorf("%s: 非法 build_env 应报错", tc.name)
+		}
 	}
 }
 

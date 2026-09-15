@@ -27,12 +27,15 @@ import (
 
 // HostResolver 用宿主机包数据库与 AUR RPC 解析软件组依赖闭包（只读查询，不安装）。
 //
+// repoDB、aurByName 与两个 Provides 索引都是可跨 Resolve 复用的元数据缓存；
+// 缓存是否已加载不改变下面的解析阶段边界。
 // 解析顺序（BFS 逐层展开 Depends）：
 //  1. 官方仓库真名：一条 pacman -Si 全量转储建内存索引；
 //  2. 官方 Provides 索引：sh、libssl.so=3-64 这类虚拟提供名映射到提供者；
-//  3. AUR 真名：一次 RPC type=info 批量查询；
-//  4. AUR Provides：RPC type=search&by=provides 按虚拟名搜索，多个命中取
-//     字典序首个并提示；选中后经 type=info 取其依赖继续展开；
+//  3. AUR 真名：优先查全量元数据缓存，转储不可用时用 RPC type=info 批量查询；
+//  4. AUR Provides：优先查全量元数据缓存，转储不可用时用 RPC
+//     type=search&by=provides 按虚拟名搜索，多个命中取字典序首个并提示；
+//     选中后经 type=info 取其依赖继续展开；
 //  5. 全部落空才按虚拟提供名略去并警告（顶层目标包落空则直接报错）。
 //
 // 得到的是“相对空系统”的完整依赖集，用于聚类与交集规划；实际安装时容器内
@@ -120,7 +123,9 @@ func (r *HostResolver) Resolve(packages []string) (*planner.Closure, error) {
 	}
 
 	for {
-		// 阶段一：仓库真名与两侧 Provides 索引消化队列，收集未命中 token
+		// 阶段一：只用官方仓库真名与官方 Provides 索引消化队列，收集未命中 token。
+		// AUR 索引虽然会跨软件组复用，但不能在这个阶段参与选择，否则缓存
+		// 是否已预热会改变同一组的解析结果。
 		var miss []string
 		missSeen := map[string]bool{}
 		for len(queue) > 0 {
@@ -135,7 +140,7 @@ func (r *HostResolver) Resolve(packages []string) (*planner.Closure, error) {
 				adopt(info)
 				continue
 			}
-			if p := r.lookupProvider(tok); p != nil {
+			if p := r.lookupRepoProvider(tok); p != nil {
 				infos[base] = p
 				if p.Name != base {
 					infos[p.Name] = p // 提供者真名也标记为已处理
@@ -181,44 +186,51 @@ func (r *HostResolver) Resolve(packages []string) (*planner.Closure, error) {
 	return c, nil
 }
 
-// lookupProvider 在官方/AUR Provides 索引中查找虚拟提供名的提供者。
-// 多个提供者时按确定性偏好排序：与虚拟名同名的 > 非 multilib 的 > 官方仓库的
-// > 字典序，并给出提示。
-func (r *HostResolver) lookupProvider(depTok string) *pkgInfo {
+// lookupRepoProvider 只在官方仓库 Provides 索引中查找提供者。
+func (r *HostResolver) lookupRepoProvider(depTok string) *pkgInfo {
+	return r.lookupProviderIndex(depTok, r.repoProviders)
+}
+
+// lookupAurProvider 只在 AUR Provides 索引中查找提供者。
+func (r *HostResolver) lookupAurProvider(depTok string) *pkgInfo {
+	return r.lookupProviderIndex(depTok, r.aurProviders)
+}
+
+// lookupProviderIndex 在给定 Provides 索引中查找虚拟提供名的提供者。
+// 多个提供者时按确定性偏好排序：与虚拟名同名的 > 非 multilib 的 > AUR 惩罚
+// > 字典序，并给出提示。官方与 AUR 的优先级由解析阶段决定，而不是由缓存索引混合决定。
+func (r *HostResolver) lookupProviderIndex(depTok string, idx map[string][]provideEntry) *pkgInfo {
 	base, _, ver := splitDep(depTok)
-	for _, idx := range []map[string][]provideEntry{r.repoProviders, r.aurProviders} {
-		cands := idx[base]
-		if len(cands) == 0 {
-			continue
-		}
-		var matched []*pkgInfo
-		for _, e := range cands {
-			// 版本约束按精确相等匹配；无版本要求则任意提供者皆可。
-			if ver == "" || e.ver == ver {
-				matched = append(matched, e.pkg)
-			}
-		}
-		if len(matched) == 0 {
-			continue
-		}
-		sort.Slice(matched, func(a, b int) bool {
-			pa, pb := providerPenalty(matched[a], base), providerPenalty(matched[b], base)
-			if pa != pb {
-				return pa < pb
-			}
-			return matched[a].Name < matched[b].Name
-		})
-		if len(matched) > 1 {
-			names := make([]string, len(matched))
-			for i, m := range matched {
-				names[i] = m.Name
-			}
-			fmt.Fprintf(os.Stderr, "[提示] %q 有多个提供者（%s），取 %s\n",
-				depTok, strings.Join(names, " "), matched[0].Name)
-		}
-		return matched[0]
+	cands := idx[base]
+	if len(cands) == 0 {
+		return nil
 	}
-	return nil
+	var matched []*pkgInfo
+	for _, e := range cands {
+		// 版本约束按精确相等匹配；无版本要求则任意提供者皆可。
+		if ver == "" || e.ver == ver {
+			matched = append(matched, e.pkg)
+		}
+	}
+	if len(matched) == 0 {
+		return nil
+	}
+	sort.Slice(matched, func(a, b int) bool {
+		pa, pb := providerPenalty(matched[a], base), providerPenalty(matched[b], base)
+		if pa != pb {
+			return pa < pb
+		}
+		return matched[a].Name < matched[b].Name
+	})
+	if len(matched) > 1 {
+		names := make([]string, len(matched))
+		for i, m := range matched {
+			names[i] = m.Name
+		}
+		fmt.Fprintf(os.Stderr, "[提示] %q 有多个提供者（%s），取 %s\n",
+			depTok, strings.Join(names, " "), matched[0].Name)
+	}
+	return matched[0]
 }
 
 // providerPenalty 提供者选择的惩罚分，越小越优先：
@@ -238,9 +250,10 @@ func providerPenalty(p *pkgInfo, virtual string) int {
 	return score
 }
 
-// resolveAurBatch 处理一轮未命中 token。优先查 AUR 全量元数据索引（一次下载
-// 全局缓存）；转储不可用时回退逐名 RPC（真名批量 info + 虚拟名 provides 搜索，
-// 多个提供者取字典序首个）。返回 base -> 包信息（仅含命中项）。
+// resolveAurBatch 处理一轮官方阶段未命中的 token。优先查 AUR 全量元数据索引
+// （一次下载全局缓存）：先按 AUR 真名查找，再按 AUR Provides 查找；转储不可用
+// 时回退逐名 RPC（真名批量 info + 虚拟名 provides 搜索，多个提供者取字典序首个）。
+// 返回 base -> 包信息（仅含命中项）。
 func (r *HostResolver) resolveAurBatch(tokens []string) map[string]*pkgInfo {
 	out := map[string]*pkgInfo{}
 	var rest []string // 转储不可用时的回退查询列表
@@ -256,8 +269,8 @@ func (r *HostResolver) resolveAurBatch(tokens []string) map[string]*pkgInfo {
 				out[base] = info
 				continue
 			}
-			// 转储刚就位，其 Provides 索引在 phase-1 还不存在，补查一次
-			if p := r.lookupProvider(base); p != nil {
+			// 转储刚就位，官方阶段已经结束，此处只补查 AUR Provides。
+			if p := r.lookupAurProvider(tok); p != nil {
 				r.virtualDone[base] = p
 				out[base] = p
 				continue
@@ -511,7 +524,7 @@ func (r *HostResolver) fetch(u string) ([]byte, error) {
 // registerProvides 把包的 Provides 条目登记进索引。
 func (r *HostResolver) registerProvides(idx map[string][]provideEntry, info *pkgInfo) {
 	for _, pv := range info.Provides {
-		base, ver, _ := splitDep(pv)
+		base, _, ver := splitDep(pv)
 		idx[base] = append(idx[base], provideEntry{ver: ver, pkg: info})
 	}
 }
@@ -757,8 +770,10 @@ type Builder struct {
 	// Groups 组级声明缓存（键=组名）：烘焙阶段取 users/services/export。
 	// nil 视作无任何新键声明，烘焙整体退化为空操作。
 	Groups map[string]*config.Group
-	// ProxyEnv 透传给容器的代理变量（K=V）；nil 表示未采集。
-	ProxyEnv []string
+	// BuildEnvKeys 配置允许透传给构建容器的宿主环境变量名。
+	BuildEnvKeys []string
+	// BuildEnv 已解析的构建环境变量（K=V）；nil 表示尚未采集，供测试注入。
+	BuildEnv []string
 	// BuilderTmpSize 构建机器容器（编译车间 build/builder 与基础镜像
 	// build/arch）/tmp 的 tmpfs 显式大小（字节，配置顶层 builder_tmp_size）：
 	// 覆写 nspawn 自动分配的 tmpfs，防内存吃紧时容器内写 /tmp 直接 ENOSPC
@@ -1117,7 +1132,7 @@ func (b *Builder) nspawnBaseArgs(tmp int64, root string, rwPool bool, args []str
 		}
 		base = append(base, mode+b.poolDir()+":"+poolMount)
 	}
-	for _, kv := range b.proxyEnv() {
+	for _, kv := range b.buildEnv() {
 		base = append(base, "--setenv="+kv)
 	}
 	if arg := config.TmpSizeArg(tmp); arg != "" {
@@ -1138,61 +1153,40 @@ func (b *Builder) buildTmpSize(groups []string) int64 {
 	return max
 }
 
-// proxyEnv 返回需要透传给容器的代理环境变量（懒解析一次）。
-// 网络拓扑说明：当前 nspawn 不隔离 network 命名空间，容器内的 127.0.0.1
-// 就是宿主机回环本身，代理地址原样透传即可；将来若启用私有网络
-// （--network-veth 等），只需在此处把 lo 地址改写为网关地址。
-func (b *Builder) proxyEnv() []string {
-	if b.ProxyEnv != nil {
-		return b.ProxyEnv
+// buildEnv 返回配置白名单中需要透传给构建容器的环境变量（懒解析一次）。
+// 变量值从宿主机进程环境读取；进程环境缺失时从 /etc/environment 补齐。
+// 日志只打印变量名，不打印变量值，避免泄露凭据。
+func (b *Builder) buildEnv() []string {
+	if b.BuildEnv != nil {
+		return b.BuildEnv
 	}
-	b.ProxyEnv = collectProxyEnv()
-	if len(b.ProxyEnv) > 0 {
-		masked := make([]string, len(b.ProxyEnv))
-		for i, kv := range b.ProxyEnv {
-			k, v, _ := strings.Cut(kv, "=")
-			masked[i] = k + "=" + maskUserinfo(v)
+	b.BuildEnv = collectBuildEnv(b.BuildEnvKeys)
+	if len(b.BuildEnv) > 0 {
+		names := make([]string, 0, len(b.BuildEnv))
+		for _, kv := range b.BuildEnv {
+			name, _, _ := strings.Cut(kv, "=")
+			names = append(names, name)
 		}
-		fmt.Fprintf(b.Out, "[proxy] 透传宿主机代理配置到容器：%s\n",
-			strings.Join(masked, " "))
+		fmt.Fprintf(b.Out, "[env] 透传构建环境变量到容器：%s\n",
+			strings.Join(names, " "))
 	}
-	return b.ProxyEnv
+	return b.BuildEnv
 }
 
 var hostEnvironmentFile = "/etc/environment"
 
-// proxyKeys 采集目标键（小写形式；大写变体按需派生）。
-var proxyKeys = []string{"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
-
-func isProxyKey(key string) bool {
-	for _, k := range proxyKeys {
-		if k == key || strings.ToUpper(k) == key {
-			return true
-		}
-	}
-	return false
+// collectBuildEnv 采集配置白名单中的宿主环境变量。
+func collectBuildEnv(names []string) []string {
+	return collectBuildEnvFrom(names, os.LookupEnv, hostEnvironmentFile)
 }
 
-// collectProxyEnv 采集宿主机代理配置（真实来源：进程环境 + /etc/environment）。
-func collectProxyEnv() []string {
-	return collectProxyEnvFrom(os.LookupEnv, hostEnvironmentFile)
-}
-
-// collectProxyEnvFrom 键的大小写保真透传：大写对大写、小写对小写，
-// 同一语义键的两个变体各自独立、互不派生——工具链对大小写的读取规则
-// 本就不同（如 curl 刻意不读大写 HTTP_PROXY），保真才能在容器内复刻
-// 宿主机的实际行为。lookup 优先于 environmentFile；文件仅按“精确键
-// （含大小写）”补缺，不覆盖已有值。输出顺序稳定：小写键在前、大写紧随。
-func collectProxyEnvFrom(lookup func(string) (string, bool), environmentFile string) []string {
-	variantOrder := make([]string, 0, len(proxyKeys)*2)
-	for _, k := range proxyKeys {
-		variantOrder = append(variantOrder, k, strings.ToUpper(k))
-	}
-
-	out := make([]string, 0, len(variantOrder))
+// collectBuildEnvFrom 按 names 的声明顺序、大小写原样收集环境变量。
+// environmentFile 仅补进程环境中缺失的精确变量名，不覆盖进程环境已有值。
+func collectBuildEnvFrom(names []string, lookup func(string) (string, bool), environmentFile string) []string {
+	out := make([]string, 0, len(names))
 	taken := map[string]bool{}
-	for _, k := range variantOrder { // 进程环境
-		if v, ok := lookup(k); ok && v != "" {
+	for _, k := range names { // 进程环境
+		if v, ok := lookup(k); ok {
 			taken[k] = true
 			out = append(out, k+"="+v)
 		}
@@ -1212,35 +1206,32 @@ func collectProxyEnvFrom(lookup func(string) (string, bool), environmentFile str
 			continue
 		}
 		key := strings.TrimSpace(line[:i])
-		val := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
-		if val == "" || !isProxyKey(key) {
+		if !containsString(names, key) {
 			continue
 		}
+		val := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
 		if _, dup := fileVal[key]; !dup {
 			fileVal[key] = val
 		}
 	}
-	for _, k := range variantOrder { // 文件只补精确缺失项
-		if taken[k] || fileVal[k] == "" {
+	for _, k := range names { // 文件只补精确缺失项
+		if taken[k] {
 			continue
 		}
-		out = append(out, k+"="+fileVal[k])
+		if v, ok := fileVal[k]; ok {
+			out = append(out, k+"="+v)
+		}
 	}
 	return out
 }
 
-// maskUserinfo 掩去代理 URL 中的用户名密码段用于日志输出。
-func maskUserinfo(u string) string {
-	schemeIdx := strings.Index(u, "://")
-	if schemeIdx < 0 {
-		return u // 无 scheme 则假定无 userinfo
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
 	}
-	rest := u[schemeIdx+3:]
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return u
-	}
-	return u[:schemeIdx+3] + "***" + rest[at:]
+	return false
 }
 
 // hostCacheDirs 返回宿主机包缓存目录列表（懒解析一次）。
