@@ -1566,6 +1566,14 @@ func (b *Builder) touchBuilderRecord(st *state.State, now time.Time) {
 // poolVersions 包名 -> 池内已收录的全部版本（repo-add 允许同名多版本并存）。
 type poolVersions map[string][]string
 
+// poolRepoEntry 是池仓库 desc 条目的最小元数据。Provides 用于在 AUR
+// Provider 选择发生变化后，清除旧 Provider 对 pacman 目标解析的遮蔽。
+type poolRepoEntry struct {
+	Name     string
+	Version  string
+	Provides []string
+}
+
 // filterBuiltTargets 按池内已收录版本过滤 AUR 构建目标：
 // 版本已知且池内有同版本产物 → 跳过；版本未知（解析期未取得上游版本）
 // 一律保守构建。返回仍需构建的目标与跳过数。
@@ -1670,37 +1678,60 @@ func minusStrings(all, keep []string) (out []string) {
 	return out
 }
 
-// parseRepoDesc 从 pacman 仓库数据库条目的 desc 文本中取包名与版本。
-func parseRepoDesc(content string) (name, version string) {
+// parseRepoDescMetadata 从 pacman 仓库数据库条目的 desc 文本中取包名、版本
+// 与 Provides。仓库数据库中的 Provides 可能跨多行，直到下一个字段或空行结束。
+func parseRepoDescMetadata(content string) (name, version string, provides []string) {
 	var field string
 	for _, ln := range strings.Split(content, "\n") {
-		switch strings.TrimSpace(ln) {
+		line := strings.TrimSpace(ln)
+		switch line {
 		case "%NAME%":
 			field = "name"
 			continue
 		case "%VERSION%":
 			field = "version"
 			continue
+		case "%PROVIDES%":
+			field = "provides"
+			continue
 		}
-		if field == "" || strings.TrimSpace(ln) == "" {
+		if strings.HasPrefix(line, "%") && strings.HasSuffix(line, "%") {
+			field = ""
+			continue
+		}
+		if field == "" || line == "" {
 			field = ""
 			continue
 		}
 		val := strings.TrimSpace(ln)
-		if field == "name" && name == "" {
-			name = val
-		} else if field == "version" && version == "" {
-			version = val
+		switch field {
+		case "name":
+			if name == "" {
+				name = val
+			}
+			field = ""
+		case "version":
+			if version == "" {
+				version = val
+			}
+			field = ""
+		case "provides":
+			provides = append(provides, strings.Fields(val)...)
 		}
-		field = ""
 	}
+	return name, version, provides
+}
+
+// parseRepoDesc 从 pacman 仓库数据库条目的 desc 文本中取包名与版本。
+func parseRepoDesc(content string) (name, version string) {
+	name, version, _ = parseRepoDescMetadata(content)
 	return name, version
 }
 
-// poolRepoVersions 解析包池的本地仓库数据库。数据库不存在或读取失败时
+// poolRepoEntries 解析包池的本地仓库数据库。数据库不存在或读取失败时
 // 返回空表（所有目标按需构建，随后 repo-add 自然收录修正）。
-func (b *Builder) poolRepoVersions() poolVersions {
-	out := poolVersions{}
+func (b *Builder) poolRepoEntries() []poolRepoEntry {
+	var out []poolRepoEntry
 	db := b.poolDBPath()
 	listing, err := b.Runner.RunOutput("tar", "-tf", db)
 	if err != nil {
@@ -1718,14 +1749,61 @@ func (b *Builder) poolRepoVersions() poolVersions {
 		if err != nil {
 			continue
 		}
-		name, ver := parseRepoDesc(content)
-		if name == "" || ver == "" {
+		name, ver, provides := parseRepoDescMetadata(content)
+		if name == "" {
 			continue
 		}
-		if !hasStr(out[name], ver) {
-			out[name] = append(out[name], ver)
+		out = append(out, poolRepoEntry{Name: name, Version: ver, Provides: provides})
+	}
+	return out
+}
+
+// poolRepoVersions 解析包池的本地仓库数据库中的版本索引。
+func (b *Builder) poolRepoVersions() poolVersions {
+	return poolVersionsFromEntries(b.poolRepoEntries())
+}
+
+func poolVersionsFromEntries(entries []poolRepoEntry) poolVersions {
+	out := poolVersions{}
+	for _, entry := range entries {
+		if entry.Version == "" || hasStr(out[entry.Name], entry.Version) {
+			continue
+		}
+		out[entry.Name] = append(out[entry.Name], entry.Version)
+	}
+	return out
+}
+
+// poolRepoProviderNames 返回池仓库中会满足 targets 的包名，包括包真名和
+// Provides 条目。它们需要在 AUR 重建前暂时从仓库登记和车间已安装状态中移除，
+// 否则 pacman 可能用旧 Provider 满足 AUR 真名目标，令 paru 不进入构建流程。
+func poolRepoProviderNames(entries []poolRepoEntry, targets []string) []string {
+	wanted := map[string]bool{}
+	for _, target := range targets {
+		wanted[target] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, entry := range entries {
+		if wanted[entry.Name] {
+			if !seen[entry.Name] {
+				seen[entry.Name] = true
+				out = append(out, entry.Name)
+			}
+			continue
+		}
+		for _, pv := range entry.Provides {
+			base, _, _ := splitDep(pv)
+			if wanted[base] {
+				if !seen[entry.Name] {
+					seen[entry.Name] = true
+					out = append(out, entry.Name)
+				}
+				break
+			}
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -1795,7 +1873,8 @@ func (b *Builder) buildAurPackages(a *reconcile.Action) error {
 	if len(a.Pkgs) == 0 {
 		return nil
 	}
-	have := b.poolRepoVersions()
+	entries := b.poolRepoEntries()
+	have := poolVersionsFromEntries(entries)
 	fmt.Fprintf(b.Out, "[aur] 池内已收录 %d 个包的版本索引\n", len(have))
 	todo, _ := filterBuiltTargets(a.Pkgs, a.Versions, have)
 	skippedNames := minusStrings(a.Pkgs, todo)
@@ -1818,15 +1897,28 @@ func (b *Builder) buildAurPackages(a *reconcile.Action) error {
 	}
 	a.Pkgs = todo
 	root := b.builderRoot()
-	// 摘除重建目标的池仓库登记：目标一旦被 repo-add 收录，paru 就把它当
-	// 普通同步仓库包——未安装时直接 file:// 装旧版、已安装时 --needed 判
-	// “已是最新”空转退出 0，两种路都绕过 makepkg 且使 --rebuild 形同虚设
-	// （它只作用于 AUR 分类的目标）。摘除后目标必然回归 AUR 分类走真构建，
-	// 产出后由下方 repo-add 重新登记。首建目标尚不在库中，报错属预期。
+	// 摘除重建目标及其旧 Provider 的池仓库登记：目标一旦被 repo-add 收录，
+	// paru 就把它当普通同步仓库包——未安装时直接 file:// 装旧版、已安装时
+	// --needed 判“已是最新”空转退出 0，两种路都绕过 makepkg 且使 --rebuild
+	// 形同虚设（它只作用于 AUR 分类的目标）。摘除后目标必然回归 AUR 分类
+	// 走真构建，产出后由下方 repo-add 重新登记。首建目标尚不在库中时，
+	// repo-remove 不会收到这个缺席目标。
+	repoRemoveNames := poolRepoProviderNames(entries, a.Pkgs)
+	removeNames := append([]string{}, a.Pkgs...)
+	removeNames = append(removeNames, repoRemoveNames...)
+	sort.Strings(removeNames)
+	removeNames = uniqueStrings(removeNames)
+	if stale := minusStrings(removeNames, a.Pkgs); len(stale) > 0 {
+		fmt.Fprintf(b.Out, "[aur] 同时暂摘旧 Provider：%v\n", stale)
+	}
 	fmt.Fprintf(b.Out, "[aur] 从池仓库暂摘重建目标：%v\n", a.Pkgs)
-	removeArgs := append([]string{"repo-remove", b.poolDBPath()}, a.Pkgs...)
-	if err := b.Runner.Run(removeArgs[0], removeArgs[1:]...); err != nil {
+	if len(repoRemoveNames) == 0 {
 		fmt.Fprintf(b.Out, "[aur] 目标此前不在池仓库中（继续）\n")
+	} else {
+		removeArgs := append([]string{"repo-remove", b.poolDBPath()}, repoRemoveNames...)
+		if err := b.Runner.Run(removeArgs[0], removeArgs[1:]...); err != nil {
+			return fmt.Errorf("暂摘池仓库目标失败: %w", err)
+		}
 	}
 	// 宿主侧刚改动过池库：容器内必须重新 -Sy 才能看到摘除后的状态。
 	if err := b.nspawn(root, "pacman", "-Sy", "--noconfirm"); err != nil {
@@ -1840,9 +1932,15 @@ func (b *Builder) buildAurPackages(a *reconcile.Action) error {
 	// --needed 就会判定“up to date -- skipping / nothing to do”直接跳过
 	// 重建，且以退出码 0 收场——导致闸门判了要重建、实际却空转并把旧包
 	// 反复收录。故构建前无条件尝试卸载；目标本就未安装时 pacman 报错属预期。
-	fmt.Fprintf(b.Out, "[aur] 清理车间残留叶子包（未安装则忽略）：%v\n", a.Pkgs)
-	purge := append([]string{"pacman", "-Rns", "--noconfirm"}, a.Pkgs...)
-	if err := b.nspawn(root, purge...); err != nil {
+	fmt.Fprintf(b.Out, "[aur] 清理车间残留目标及 Provider（未安装则忽略）：%v\n", removeNames)
+	purged := false
+	for _, name := range removeNames {
+		purge := []string{"pacman", "-Rns", "--noconfirm", name}
+		if err := b.nspawn(root, purge...); err == nil {
+			purged = true
+		}
+	}
+	if !purged {
 		fmt.Fprintf(b.Out, "[aur] 目标此前未安装（继续）\n")
 	}
 	args := append([]string{

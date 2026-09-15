@@ -848,6 +848,41 @@ func TestBuildAurRunsInBuilderAndRegistersRepo(t *testing.T) {
 		"pacman", "-Rns", "--noconfirm", "visual-studio-code-bin")
 }
 
+func TestBuildAurRemovesStaleProvider(t *testing.T) {
+	base := t.TempDir()
+	pool := filepath.Join(base, "pool")
+	if err := os.MkdirAll(pool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(pool, poolDBName)
+	descPath := "meowsub-pool-abc/desc"
+	r := &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{
+		"tar -tf " + db: {
+			Out: descPath + "\n",
+		},
+		"tar -xOf " + db + " " + descPath: {
+			Out: "%NAME%\nlinuxqq-appimage\n\n" +
+				"%VERSION%\n3.2.33_20260902-1\n\n" +
+				"%PROVIDES%\nqq\nlinuxqq\n",
+		},
+	}}
+	b := New(r, os.Stderr, base)
+	acts := []*reconcile.Action{{Type: reconcile.ActBuildAur, Name: "aur",
+		Path: pool, Pkgs: []string{"linuxqq"}}}
+	if _, err := b.Execute(acts, state.NewEmpty(), ""); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// linuxqq 尚未进入池数据库，但旧 Provider 已在其中；repo-remove 只能传实际存在的包。
+	remove := findCmd(t, r, "repo-remove", db, "linuxqq-appimage")
+	if len(remove.Args) != 2 || remove.Args[0] != db || remove.Args[1] != "linuxqq-appimage" {
+		t.Fatalf("repo-remove 不应包含缺席的 linuxqq：%v", remove.Args)
+	}
+	// pacman 删除逐包执行，确保未安装的 linuxqq 不会阻止旧 Provider 被卸载。
+	findCmd(t, r, "systemd-nspawn", "pacman", "-Rns", "--noconfirm", "linuxqq-appimage")
+	findCmd(t, r, "systemd-nspawn", "runuser", "-u", "builder", "--", "paru", "-S",
+		"--rebuild", "--needed", "--noconfirm", "linuxqq")
+}
+
 // ---- HostResolver ----
 
 // gzBytes 构造 AUR 转储桩所需的 gzip 字节流。
