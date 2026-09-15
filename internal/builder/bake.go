@@ -436,7 +436,10 @@ func classifyPkgFiles(layer, pkg string, files []string) (state.ExportEntry, boo
 			if rerr != nil {
 				continue
 			}
-			app := state.ExportApp{DesktopID: strings.TrimSuffix(base, ".desktop")}
+			app := state.ExportApp{
+				DesktopID: strings.TrimSuffix(base, ".desktop"),
+				Name:      desktopNameField(data),
+			}
 			_, app.IconRel = findLayerIcon(layer, desktopIconField(data))
 			e.Apps = append(e.Apps, app)
 		}
@@ -448,9 +451,10 @@ func classifyPkgFiles(layer, pkg string, files []string) (state.ExportEntry, boo
 	return e, len(e.Bins) > 0 || len(e.Apps) > 0
 }
 
-// desktopIconField 从 .desktop 文本提取 [Desktop Entry] 段的 Icon= 值。
-func desktopIconField(data []byte) string {
+// desktopEntryField 从 .desktop 文本提取 [Desktop Entry] 段的指定字段。
+func desktopEntryField(data []byte, key string) string {
 	sec := false
+	prefix := key + "="
 	sc := bufio.NewScanner(strings.NewReader(string(data)))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -458,11 +462,21 @@ func desktopIconField(data []byte) string {
 			sec = line == "[Desktop Entry]"
 			continue
 		}
-		if sec && strings.HasPrefix(line, "Icon=") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "Icon="))
+		if sec && strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
 		}
 	}
 	return ""
+}
+
+// desktopNameField 从 .desktop 文本提取 [Desktop Entry] 段的 Name= 值。
+func desktopNameField(data []byte) string {
+	return desktopEntryField(data, "Name")
+}
+
+// desktopIconField 从 .desktop 文本提取 [Desktop Entry] 段的 Icon= 值。
+func desktopIconField(data []byte) string {
+	return desktopEntryField(data, "Icon")
 }
 
 // findLayerIcon 在层内定位图标相对路径：

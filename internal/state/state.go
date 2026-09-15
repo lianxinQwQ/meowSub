@@ -79,6 +79,8 @@ type State struct {
 type ExportApp struct {
 	// DesktopID usr/share/applications/<ID>.desktop 的基名（去后缀）。
 	DesktopID string `json:"desktop_id"`
+	// Name 原始 Desktop Entry 的人类可读名称；缺失时由导出侧回退到 DesktopID。
+	Name string `json:"name,omitempty"`
 	// IconRel 层内最大尺寸图标相对路径；未找到为空。
 	IconRel string `json:"icon_rel,omitempty"`
 }

@@ -37,12 +37,15 @@ func managedTag(group string) string {
 // run-desktop 命令：给定组与实例内 .desktop 路径即可在容器内启动应用。
 // selfBin 是生成时刻 meowsub 本体的自定位路径——Name 后缀带上组名，
 // 多个子系统导出同名软件包时在启动器里可分辨。
-func desktopStub(group, id, selfBin string, withIcon bool) string {
+func desktopStub(group, id, name, selfBin string, withIcon bool) string {
+	if strings.TrimSpace(name) == "" {
+		name = id
+	}
 	target := "/usr/share/applications/" + id + ".desktop"
 	var b strings.Builder
 	b.WriteString(managedTag(group))
 	b.WriteString("[Desktop Entry]\nType=Application\n")
-	b.WriteString("Name=" + id + " (meowsub-" + group + ")\n")
+	b.WriteString("Name=" + name + " (meowsub-" + group + ")\n")
 	b.WriteString("Exec=" + quoteDesktopExecPath(selfBin) +
 		" run-desktop --detach " + group + " " + target + " %U\n")
 	// TryExec 按规范是单一路径值，不参与参数切分，原样写出。
@@ -203,7 +206,7 @@ func SyncExports(cfg *config.Config, st *state.State, selfBin string) error {
 				df := filepath.Join(desktopRoot,
 					fmt.Sprintf("meowsub-%s-%s.desktop",
 						g.Name, app.DesktopID))
-				content := desktopStub(g.Name, app.DesktopID, selfBin, withIcon)
+				content := desktopStub(g.Name, app.DesktopID, app.Name, selfBin, withIcon)
 				if _, err := writeIfChanged(df, content, 0o644); err != nil {
 					return err
 				}

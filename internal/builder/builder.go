@@ -25,18 +25,24 @@ import (
 	"meowsub/internal/state"
 )
 
-// HostResolver 用宿主机包数据库与 AUR RPC 解析软件组依赖闭包（只读查询，不安装）。
+// HostResolver 用宿主机包数据库与 AUR 元数据解析软件组依赖闭包（只读查询，不安装）。
 //
-// repoDB、aurByName 与两个 Provides 索引都是可跨 Resolve 复用的元数据缓存；
-// 缓存是否已加载不改变下面的解析阶段边界。
-// 解析顺序（BFS 逐层展开 Depends）：
-//  1. 官方仓库真名：一条 pacman -Si 全量转储建内存索引；
-//  2. 官方 Provides 索引：sh、libssl.so=3-64 这类虚拟提供名映射到提供者；
-//  3. AUR 真名：优先查全量元数据缓存，转储不可用时用 RPC type=info 批量查询；
-//  4. AUR Provides：优先查全量元数据缓存，转储不可用时用 RPC
-//     type=search&by=provides 按虚拟名搜索，多个命中取字典序首个并提示；
-//     选中后经 type=info 取其依赖继续展开；
+// repoDB、aurByName 与两个 Provides 索引都是可跨 Resolve 复用的元数据缓存。
+// 每个依赖 token 按同一张优先级表解析（BFS 逐层展开 Depends），判定结果与
+// 缓存加载时机、转储/RPC 回退路径无关：
+//  1. 官方仓库真名：一条 pacman -Si 全量转储建内存索引，版本约束校验；
+//  2. 官方仓库 Provides：sh、libssl.so=3-64 这类虚拟提供名映射到提供者，
+//     约束过滤后按统一偏好选定；
+//  3. AUR 真名：全量元数据转储（不可用时回退 RPC type=info），版本约束校验；
+//  4. AUR Provides：转储索引或 RPC provides 搜索，约束过滤 + 同一偏好选定；
 //  5. 全部落空才按虚拟提供名略去并警告（顶层目标包落空则直接报错）。
+//
+// 次序的关键约束：官方两层在 Resolve 启动时即就绪；AUR 两层一律推迟到
+// 元数据就绪后（阶段二）判定——绝不让 AUR Provides 在阶段一与官方
+// Provides 抢答，否则“既是 AUR 真名又被其他包 Provides”的名字（如
+// linuxqq）会随缓存冷热漂移出不同结果。提供者选定规则统一在
+// lookupProviderIndex：同名 > 非 lib32，同分字典序（AUR 提供者另有
+// +10 惩罚，官方与 AUR 的先后由解析阶段决定），多候选打印提示。
 //
 // 得到的是“相对空系统”的完整依赖集，用于聚类与交集规划；实际安装时容器内
 // 的 paru --needed 仍会按子系统自身的已装状态精确解析。
@@ -252,8 +258,8 @@ func providerPenalty(p *pkgInfo, virtual string) int {
 
 // resolveAurBatch 处理一轮官方阶段未命中的 token。优先查 AUR 全量元数据索引
 // （一次下载全局缓存）：先按 AUR 真名查找，再按 AUR Provides 查找；转储不可用
-// 时回退逐名 RPC（真名批量 info + 虚拟名 provides 搜索，多个提供者取字典序首个）。
-// 返回 base -> 包信息（仅含命中项）。
+// 时回退逐名 RPC（真名批量 info + 虚拟名 provides 搜索候选，选定规则与转储
+// 路径一致）。返回 base -> 包信息（仅含命中项）。
 func (r *HostResolver) resolveAurBatch(tokens []string) map[string]*pkgInfo {
 	out := map[string]*pkgInfo{}
 	var rest []string // 转储不可用时的回退查询列表
@@ -299,24 +305,24 @@ func (r *HostResolver) resolveAurBatch(tokens []string) map[string]*pkgInfo {
 		searchSeen[base] = true
 		searchList = append(searchList, base)
 	}
-	var chosen []string
-	chosenFor := map[string]string{} // 虚拟名 -> 选中的提供者真名
+	// 搜索只回候选真名；批量取元数据登记进 Provides 索引后，走与转储路径
+	// 完全相同的约束过滤 + 偏好选定 + 提示，避免两条路径选出不同提供者。
+	var probe []string
+	probeSeen := map[string]bool{}
 	for _, v := range searchList {
-		names := r.rpcSearchProvides(v)
-		if len(names) == 0 {
-			continue
+		for _, n := range r.rpcSearchProvides(v) {
+			if probeSeen[n] {
+				continue
+			}
+			probeSeen[n] = true
+			probe = append(probe, n)
 		}
-		sort.Strings(names)
-		chosenFor[v] = names[0]
-		chosen = append(chosen, names[0])
 	}
-	for base, info := range r.rpcInfo(uniqueStrings(chosen)) {
-		out[base] = info
-	}
-	for v, pkgName := range chosenFor {
-		if info := r.aurByName[pkgName]; info != nil && out[v] == nil {
-			r.virtualDone[v] = info
-			out[v] = info
+	r.rpcInfo(probe)
+	for _, v := range searchList {
+		if p := r.lookupAurProvider(v); p != nil {
+			r.virtualDone[v] = p
+			out[v] = p
 		}
 	}
 	return out
@@ -478,10 +484,8 @@ func (r *HostResolver) rpcInfo(names []string) map[string]*pkgInfo {
 }
 
 // rpcSearchProvides 用 RPC type=search&by=provides 搜索提供某虚拟名的 AUR 包。
+// 调用方负责防重查（resolveAurBatch 的 virtualDone 闸门已过滤已定论的名字）。
 func (r *HostResolver) rpcSearchProvides(virtual string) []string {
-	if cached := r.virtualDone[virtual]; cached != nil {
-		return nil // 已定论（成功或失败）不再搜索
-	}
 	u := aurRPCBase + "type=search&by=provides&arg[]=" + url.QueryEscape(virtual)
 	data, err := r.fetch(u)
 	if err != nil {

@@ -95,7 +95,7 @@ func syncFixture(t *testing.T) (string, *state.State, string) {
 	layer := filepath.Join(base, "runs", "code")
 	m := &state.Marker{Name: "code", Export: []state.ExportEntry{
 		{Package: "vim", Bins: []string{"/usr/bin/vim", "/usr/bin/view"},
-			Apps: []state.ExportApp{{DesktopID: "vim",
+			Apps: []state.ExportApp{{DesktopID: "vim", Name: "Vim",
 				IconRel: "usr/share/icons/hicolor/48x48/apps/vim.png"}}},
 		{Package: "musescore", Apps: []state.ExportApp{
 			{DesktopID: "mscore"}}}}}
@@ -144,7 +144,7 @@ func TestSyncExportsGeneratesRegistersAndSweeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("desktop 未生成: %v", err)
 	}
-	if !strings.Contains(string(got), "Name=vim (meowsub-code)\n") {
+	if !strings.Contains(string(got), "Name=Vim (meowsub-code)\n") {
 		t.Fatalf("Name 应带组名后缀:\n%s", got)
 	}
 	wantExec := "Exec=" + testSelfBin + " run-desktop --detach code " +
@@ -191,7 +191,7 @@ func TestSyncExportsFallsBackToBuildLayer(t *testing.T) {
 	layer := filepath.Join(base, "build", "code") // 只有构建区成品，无 runs 实例
 	m := &state.Marker{Name: "code", Export: []state.ExportEntry{
 		{Package: "vim", Bins: []string{"/usr/bin/vim"},
-			Apps: []state.ExportApp{{DesktopID: "vim",
+			Apps: []state.ExportApp{{DesktopID: "vim", Name: "Vim",
 				IconRel: "usr/share/icons/hicolor/48x48/apps/vim.png"}}}}}
 	writeFile(t, filepath.Join(layer,
 		"usr/share/icons/hicolor/48x48/apps/vim.png"), "icon")

@@ -178,7 +178,8 @@ func TestBakePackageExportsBinsAppsIcons(t *testing.T) {
 	if len(vim.Bins) != 1 || vim.Bins[0] != "/usr/bin/vim" {
 		t.Fatalf("vim.Bins = %v", vim.Bins)
 	}
-	if len(vim.Apps) != 1 || vim.Apps[0].DesktopID != "vim" {
+	if len(vim.Apps) != 1 || vim.Apps[0].DesktopID != "vim" ||
+		vim.Apps[0].Name != "Vim" {
 		t.Fatalf("vim.Apps = %+v", vim.Apps)
 	}
 	if vim.Apps[0].IconRel != filepath.Join("usr", "share", "icons",
