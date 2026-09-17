@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,9 +36,13 @@ var SocketPath = "/run/meowsubd.sock"
 // MachineName 实例对应的 systemd-machined 机器名：确定性命名支撑“有则复用”。
 func MachineName(run string) string { return "ms-" + run }
 
-// Server 服务状态。Run 供测试注入命令执行；生产为 exec 直通。
+// Server 服务状态。Exec 供测试注入命令执行；生产为 exec 直通。
 type Server struct {
-	Cfg *config.Config
+	// cfgRef 当前生效配置快照。cfgPath 非空时每次引导前当场重读并原子
+	// 换入（改配置无需重启守护进程，下一拍引导即生效）；读取一律经
+	// cfg()，与换入点（reloadCfg）保持竞争安全。
+	cfgRef  atomic.Pointer[config.Config]
+	cfgPath string
 	// Exec 进程启动器：生产为 exec.Command；测试注入受控行为。
 	Exec func(name string, args ...string) *exec.Cmd
 
@@ -49,10 +54,16 @@ type Server struct {
 	binds map[string]map[string]graphical.Bind
 }
 
-// NewServer 构造服务并预登记 autostart 组的会话出身。
-func NewServer(cfg *config.Config) *Server {
-	s := &Server{Cfg: cfg, tb: NewTable(), pros: map[string]*exec.Cmd{},
+// NewServer 构造服务并预登记 autostart 组的会话出身。cfgPath 可变参：
+// 正式路径由 daemon.Run 传入，此后每次引导前当场重读；缺省（测试直构）
+// 不重读，沿用构造时的配置。
+func NewServer(cfg *config.Config, cfgPath ...string) *Server {
+	s := &Server{tb: NewTable(), pros: map[string]*exec.Cmd{},
 		binds: map[string]map[string]graphical.Bind{}, Exec: exec.Command}
+	s.cfgRef.Store(cfg)
+	if len(cfgPath) > 0 {
+		s.cfgPath = cfgPath[0]
+	}
 	for _, g := range cfg.Groups {
 		if g.Autostart {
 			s.tb.Ensure(g.Name, g.Name, OriginAutostart)
@@ -61,9 +72,27 @@ func NewServer(cfg *config.Config) *Server {
 	return s
 }
 
+// cfg 当前生效配置快照。
+func (s *Server) cfg() *config.Config { return s.cfgRef.Load() }
+
+// reloadCfg 引导前的配置重读：当场读盘并原子换入。cfgPath 未设置（测试
+// 直构）时不做任何事；读盘或校验失败即报错拒绝引导——沿用旧快照静默
+// 引导只会把“改了没生效”的困惑换一种形式重演。
+func (s *Server) reloadCfg() error {
+	if s.cfgPath == "" {
+		return nil
+	}
+	cfg, err := config.Load(s.cfgPath)
+	if err != nil {
+		return fmt.Errorf("重读配置 %s 失败: %w", s.cfgPath, err)
+	}
+	s.cfgRef.Store(cfg)
+	return nil
+}
+
 // groupFor 解析 run 对应的组配置；组不可考返回 nil。
 func (s *Server) groupFor(run string) *config.Group {
-	for _, g := range s.Cfg.Groups {
+	for _, g := range s.cfg().Groups {
 		if run == g.Name || strings.HasSuffix(run, "@"+g.Name) {
 			return g
 		}
@@ -93,10 +122,10 @@ func (s *Server) authorize(group string, callerUID int) error {
 
 // --- 磁盘与机器辅助 -----------------------------------------------------
 
-func (s *Server) runsRoot() string { return filepath.Join(s.Cfg.BaseDir, "runs") }
+func (s *Server) runsRoot() string { return filepath.Join(s.cfg().BaseDir, "runs") }
 
 func (s *Server) buildLayer(g string) string {
-	return filepath.Join(s.Cfg.BaseDir, "build", g)
+	return filepath.Join(s.cfg().BaseDir, "build", g)
 }
 
 func (s *Server) listRuns() []string {
@@ -157,14 +186,15 @@ func (s *Server) poweroff(run string) error {
 // 同步锁在此把关：build 收尾交换实例目录期间拒绝任何拉起，防止新容器
 // 抱着正在被替换的旧树。会话直通参数按组配置的 session_mode 组装。
 func (s *Server) boot(run string) error {
-	if InstanceLocked(s.Cfg.BaseDir, run) {
+	cfg := s.cfg()
+	if InstanceLocked(cfg.BaseDir, run) {
 		return fmt.Errorf("实例 %s 同步锁定中（build 收尾），稍后重试", run)
 	}
 	// 同一次扫描既生成绑挂参数又登记身份，保证缓存与 nspawn 实际所挂一致。
 	scan := graphical.Scan()
-	args := sessionBootArgs(s.Cfg, run, scan)
-	args = append(args, tmpfsBootArgs(s.Cfg, run)...)
-	args = append(args, mountBootArgs(s.Cfg, run)...)
+	args := sessionBootArgs(cfg, run, scan)
+	args = append(args, tmpfsBootArgs(cfg, run)...)
+	args = append(args, mountBootArgs(cfg, run)...)
 	cmd := s.Exec("systemd-nspawn", append([]string{"--boot",
 		"-D", s.runRoot(run), "--machine=" + MachineName(run)}, args...)...)
 	cmd.Stdout = io.Discard
@@ -197,7 +227,7 @@ func (s *Server) boot(run string) error {
 // 轮换；容器内视图可见性探活负责捕获 logind 私有 tmpfs 遮蔽与拆除。方案
 // 按组配置的 session_mode 分流（off 直接跳过；X11 目录恒直通）。
 func (s *Server) ensureSession(run string, uid int) {
-	mode := sessionModeFor(s.Cfg, run)
+	mode := sessionModeFor(s.cfg(), run)
 	if mode == config.SessionModeOff {
 		return
 	}
@@ -449,7 +479,13 @@ func originFor(cfg *config.Config, group string) InstanceOrigin {
 
 // ensureInstance 保证该组存在可运行实例：复用任一该组实例；否则以组名
 // 隐式部署（构建成品 → 基线 → 实例）。差异确认非交互放行但摘要打印留痕。
+// 此处是所有引导路径（autostart 预引导、start、应用类操作的隐式拉起）的
+// 公共必经点：引导前在此当场重读配置，daemon 启动后的配置改动下一拍
+// 引导即生效，无需重启守护进程。
 func (s *Server) ensureInstance(group string) (string, bool, error) {
+	if err := s.reloadCfg(); err != nil {
+		return "", false, err
+	}
 	for _, r := range s.listRuns() {
 		if r == group || strings.HasSuffix(r, "@"+group) {
 			return r, false, nil
@@ -460,7 +496,7 @@ func (s *Server) ensureInstance(group string) (string, bool, error) {
 			s.buildLayer(group))
 	}
 	fmt.Printf("[meowsubd] 组 %s 无既有实例，按三区链隐式创建\n", group)
-	p := runner.Paths{BaseDir: s.Cfg.BaseDir,
+	p := runner.Paths{BaseDir: s.cfg().BaseDir,
 		In: strings.NewReader("y\n"), Out: os.Stdout}
 	if err := p.Deploy(s.buildLayer(group), group, true); err != nil {
 		return "", false, err
@@ -478,9 +514,9 @@ func (s *Server) ensureRunning(group string) (string, error) {
 			return "", err
 		}
 		run = n
-		s.tb.Ensure(run, group, originFor(s.Cfg, group))
+		s.tb.Ensure(run, group, originFor(s.cfg(), group))
 	} else if _, ok := s.tb.Get(run); !ok {
-		s.tb.Ensure(run, group, originFor(s.Cfg, group))
+		s.tb.Ensure(run, group, originFor(s.cfg(), group))
 	}
 	if !s.running(run) { // 刚部署完，需引导
 		if err := s.boot(run); err != nil {
@@ -585,7 +621,7 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 		run := s.pickRun(group)
 		if r.Op == OpStart {
 			origin := OriginExplicit
-			if autostartOn(s.Cfg, group) && run == group {
+			if autostartOn(s.cfg(), group) && run == group {
 				origin = OriginAutostart
 			}
 			s.tb.Ensure(run, group, origin)
@@ -673,7 +709,7 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 
 	if r.Wait { // 前台阻塞：响应随应用退出返回；客户端断开即连锁终结
 		defer s.releaseAndReap(run)
-		layer := filepath.Join(s.Cfg.BaseDir, "runs", run)
+		layer := filepath.Join(s.cfg().BaseDir, "runs", run)
 		argv, rerr := resolveLaunch(layer, r)
 		if rerr != nil {
 			return errf("%v", rerr)
@@ -705,7 +741,7 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 	}
 
 	go func() { // launch / run-desktop：提交即忘（应用启动，无输出可回传）
-		layer := filepath.Join(s.Cfg.BaseDir, "runs", run)
+		layer := filepath.Join(s.cfg().BaseDir, "runs", run)
 		argv, rerr := resolveLaunch(layer, r)
 		if rerr != nil {
 			fmt.Printf("[meowsubd] %v\n", rerr)

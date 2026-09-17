@@ -32,11 +32,8 @@ func runDaemonRun(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return fmt.Errorf("参数错误: %w", err)
 	}
-	cfg, err := config.Load(*f)
-	if err != nil {
-		return err
-	}
-	return daemon.Run(cfg)
+	// 启动时校验一次确保快速失败；此后守护进程每次引导前当场重读该路径。
+	return daemon.Run(*f)
 }
 
 // runStartStop 经守护进程启停指定组的使用态实例。

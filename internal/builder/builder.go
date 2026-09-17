@@ -2218,15 +2218,45 @@ func (b *Builder) materializeSmall(a *reconcile.Action, st *state.State,
 	return nil
 }
 
-// landFromMemory 把内存副本相对盘上基准的差异逐文件落盘：
-// 常规文件先对暂存文件算一次校验和，再到索引按同路径同尺寸筛候选，读候选
-// 核验，命中则 reflink 共享对方数据块，全不命中才真正写新数据；符号链接
-// 按“路径→目标”整体落盘（无数据块，不进去重索引）。返回本轮落盘的相对
-// 路径清单（常规文件 + 链接，调用方据其做增量并入索引）。
+// landFromMemory 把内存副本相对盘上基准的差异按事务落盘，目录与文件、
+// 链接同权对账。顺序即安全：先撤旧（消失的文件/链接、已变空的消失目录，
+// 新目录才不会与残留项抢位），再补建目录（按内存树清单与权限位，幂等），
+// 最后落文件与链接。常规文件先对暂存文件算一次校验和，再到索引按同路径
+// 同尺寸筛候选，读候选核验，命中则 reflink 共享对方数据块，全不命中才
+// 真正写新数据；符号链接按“路径→目标”整体落盘（无数据块，不进去重索
+// 引）。返回本轮落盘的相对路径清单（常规文件 + 链接，调用方据其做增量
+// 并入索引）。
 func (b *Builder) landFromMemory(mem, lower, dest string, ix *fileindex.Index) ([]string, error) {
-	newFiles, removed, newLinks := diffForLanding(mem, lower)
-	relinked, kept, linked := 0, 0, 0
-	for _, rel := range newFiles {
+	diff := diffForLanding(mem, lower)
+	relinked, kept, linked, created := 0, 0, 0, 0
+	for _, rel := range diff.removed {
+		os.Remove(filepath.Join(dest, rel))
+	}
+	// 剪除内存侧已消失的目录：对账单按字典序排列（父先于子），倒序即
+	// 先深后浅；仅当已空才删得动——os.Remove 对非空目录必然失败，忽略
+	// 错误即“非空不动”。
+	for i := len(diff.removedDirs) - 1; i >= 0; i-- {
+		p := filepath.Join(dest, diff.removedDirs[i])
+		if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+			continue
+		}
+		os.Remove(p)
+	}
+	// 补建目录：MkdirAll 幂等，随后权限位对齐内存树（cp -a 保真口径）。
+	for _, dir := range diff.newDirs {
+		dstPath := filepath.Join(dest, dir.rel)
+		_, lerr := os.Lstat(dstPath)
+		if err := os.MkdirAll(dstPath, 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(dstPath, dir.perm); err != nil {
+			return nil, err
+		}
+		if lerr != nil {
+			created++
+		}
+	}
+	for _, rel := range diff.newFiles {
 		srcFile := filepath.Join(mem, rel)
 		fi, err := os.Stat(srcFile)
 		if err != nil || !fi.Mode().IsRegular() {
@@ -2258,7 +2288,7 @@ func (b *Builder) landFromMemory(mem, lower, dest string, ix *fileindex.Index) (
 		}
 		kept++
 	}
-	for _, rel := range newLinks {
+	for _, rel := range diff.newLinks {
 		target, err := os.Readlink(filepath.Join(mem, rel))
 		if err != nil {
 			return nil, fmt.Errorf("读取暂存链接 %s: %w", rel, err)
@@ -2273,13 +2303,10 @@ func (b *Builder) landFromMemory(mem, lower, dest string, ix *fileindex.Index) (
 		}
 		linked++
 	}
-	for _, rel := range removed {
-		os.Remove(filepath.Join(dest, rel))
-	}
-	ix.Absorb(dest, newFiles)
-	fmt.Fprintf(b.Out, "[mem] 落盘完成：reflink 回共享 %d，新增独占 %d，链接 %d，移除 %d\n",
-		relinked, kept, linked, len(removed))
-	return append(newFiles, newLinks...), nil
+	ix.Absorb(dest, diff.newFiles)
+	fmt.Fprintf(b.Out, "[mem] 落盘完成：reflink 回共享 %d，新增独占 %d，链接 %d，移除 %d，目录新建 %d 剪除 %d\n",
+		relinked, kept, linked, len(diff.removed), created, len(diff.removedDirs))
+	return append(diff.newFiles, diff.newLinks...), nil
 }
 
 // chooseSource 在索引里找同路径同尺寸且内容一致的来源系统文件。
@@ -2316,21 +2343,33 @@ func (b *Builder) placePlain(src, dst string) error {
 	return err
 }
 
-// verifyLanding 落盘一致性校验（--verify）：逐条比对暂存树（内存系统）与
-// 落盘树（实体系统）——常规文件比尺寸与 SHA256，符号链接比目标串；反向
-// 要求实体侧不出现暂存侧没有的条目。
+// verifyLanding 落盘一致性校验（--verify）：全树比对暂存树（内存系统）与
+// 落盘树（实体系统）——常规文件比尺寸与 SHA256，符号链接比目标串，目录比
+// 存在性（两侧双向）；反向要求实体侧不出现暂存侧没有的条目。
 // 不一致即报错并附前若干条明细，由调用方中止本轮收尾。
 func (b *Builder) verifyLanding(mem, dest string) error {
 	const maxShow = 10
 	var bad []string
 	memSeen := map[string]bool{}
+	memDirs := map[string]bool{}
 	count := 0
 	filepath.WalkDir(mem, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return nil
 		}
 		rel, rerr := filepath.Rel(mem, path)
 		if rerr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if rel == "." {
+				return nil
+			}
+			count++
+			memDirs[rel] = true
+			if fi, derr := os.Lstat(filepath.Join(dest, rel)); derr != nil || !fi.IsDir() {
+				bad = append(bad, fmt.Sprintf("%s: 目录缺失或类型漂移（%v）", rel, derr))
+			}
 			return nil
 		}
 		dp := filepath.Join(dest, rel)
@@ -2365,15 +2404,24 @@ func (b *Builder) verifyLanding(mem, dest string) error {
 		return nil
 	})
 	filepath.WalkDir(dest, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return nil
-		}
-		if d.Type()&os.ModeSymlink == 0 && !d.Type().IsRegular() {
-			return nil // socket/fifo 等特殊文件不在比对口径内
 		}
 		rel, rerr := filepath.Rel(dest, path)
 		if rerr != nil {
 			return nil
+		}
+		if d.IsDir() {
+			if rel == "." {
+				return nil
+			}
+			if !memDirs[rel] {
+				bad = append(bad, fmt.Sprintf("%s: 实体侧多出目录", rel))
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink == 0 && !d.Type().IsRegular() {
+			return nil // socket/fifo 等特殊文件不在比对口径内
 		}
 		if !memSeen[rel] {
 			bad = append(bad, fmt.Sprintf("%s: 实体侧多出条目", rel))
@@ -2391,26 +2439,54 @@ func (b *Builder) verifyLanding(mem, dest string) error {
 	return nil
 }
 
+// landingDir 是暂存侧的一个真实目录：落盘时按其权限位补建。
+type landingDir struct {
+	rel  string
+	perm os.FileMode
+}
+
+// landingDiff 是一次落盘事务的完整对账单：目录与文件、链接同权参与
+// 增删——newDirs 需在盘上补齐（含权限位），removedDirs 需从盘上剪除
+// （仅当已空，非空目录在落盘阶段自然删不动）。
+type landingDiff struct {
+	newFiles    []string
+	newDirs     []landingDir
+	newLinks    []string
+	removed     []string
+	removedDirs []string
+}
+
 // diffForLanding 比较"内存副本 vs 盘上基准"（lower 为空表示全新落盘，
-// 一切皆新增）：返回需落盘的常规文件、符号链接与需从盘上移除的路径。
-// 暂存侧常规文件每文件只哈希一次；基准侧先以尺寸粗筛，尺寸相同才读内容
-// 比对。符号链接按“路径→目标”整体比对，不读内容；暂存侧缺失的同名条目
-// 无论原类型一律移除（链接与文件同权参与事务增删）。
-func diffForLanding(staged, lower string) (newFiles, removed, newLinks []string) {
+// 一切皆新增）：返回需落盘的常规文件、目录、符号链接与需从盘上移除的
+// 路径。暂存侧常规文件每文件只哈希一次；基准侧先以尺寸粗筛，尺寸相同
+// 才读内容比对。符号链接按“路径→目标”整体比对，不读内容；暂存侧缺失
+// 的同名条目无论原类型一律移除（链接、文件与目录同权参与事务增删）。
+// 目录与链接一样不进去重索引（无数据块），但必须存在于对账单。
+func diffForLanding(staged, lower string) landingDiff {
+	var d landingDiff
 	sums := map[string]string{}  // rel -> 暂存侧常规文件 sha256
 	sizes := map[string]int64{}  // rel -> 暂存侧常规文件尺寸
 	links := map[string]string{} // rel -> 暂存侧符号链接目标
-	filepath.WalkDir(staged, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	dirs := map[string]os.FileMode{}
+	filepath.WalkDir(staged, func(path string, de os.DirEntry, err error) error {
+		if err != nil {
 			return nil
 		}
 		rel, rerr := filepath.Rel(staged, path)
 		if rerr != nil {
 			return nil
 		}
+		if de.IsDir() {
+			if rel != "." {
+				if fi, ierr := de.Info(); ierr == nil {
+					dirs[rel] = fi.Mode().Perm()
+				}
+			}
+			return nil
+		}
 		switch {
-		case d.Type().IsRegular():
-			fi, ferr := d.Info()
+		case de.Type().IsRegular():
+			fi, ferr := de.Info()
 			if ferr != nil || !fi.Mode().IsRegular() {
 				return nil
 			}
@@ -2420,7 +2496,7 @@ func diffForLanding(staged, lower string) (newFiles, removed, newLinks []string)
 			}
 			sums[rel] = sum
 			sizes[rel] = fi.Size()
-		case d.Type()&os.ModeSymlink != 0:
+		case de.Type()&os.ModeSymlink != 0:
 			target, lerr := os.Readlink(path)
 			if lerr != nil {
 				return nil
@@ -2432,28 +2508,41 @@ func diffForLanding(staged, lower string) (newFiles, removed, newLinks []string)
 
 	collectNew := func() {
 		for rel := range sums {
-			newFiles = append(newFiles, rel)
+			d.newFiles = append(d.newFiles, rel)
+		}
+		for rel, perm := range dirs {
+			d.newDirs = append(d.newDirs, landingDir{rel: rel, perm: perm})
 		}
 		for rel := range links {
-			newLinks = append(newLinks, rel)
+			d.newLinks = append(d.newLinks, rel)
 		}
-		sort.Strings(newFiles)
-		sort.Strings(newLinks)
+		sort.Strings(d.newFiles)
+		sort.Slice(d.newDirs, func(i, j int) bool { return d.newDirs[i].rel < d.newDirs[j].rel })
+		sort.Strings(d.newLinks)
 	}
 	if lower == "" {
 		collectNew()
-		sort.Strings(removed)
-		return newFiles, removed, newLinks
+		sort.Strings(d.removed)
+		sort.Strings(d.removedDirs)
+		return d
 	}
-	filepath.WalkDir(lower, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	filepath.WalkDir(lower, func(path string, de os.DirEntry, err error) error {
+		if err != nil {
 			return nil
 		}
 		rel, rerr := filepath.Rel(lower, path)
 		if rerr != nil {
 			return nil
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if de.IsDir() {
+			if rel != "." {
+				if _, ok := dirs[rel]; !ok {
+					d.removedDirs = append(d.removedDirs, rel) // 内存侧已消失
+				}
+			}
+			return nil
+		}
+		if de.Type()&os.ModeSymlink != 0 {
 			// 盘上链接：暂存侧同为目标一致的链接 → 未变化；目标漂移或
 			// 暂存侧已换成常规文件 → 重写（落盘前先移除）；暂存侧没有 →
 			// 随事务消失。
@@ -2464,22 +2553,22 @@ func diffForLanding(staged, lower string) (newFiles, removed, newLinks []string)
 				return nil
 			}
 			if _, isFile := sums[rel]; !isFile {
-				removed = append(removed, rel)
+				d.removed = append(d.removed, rel)
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() {
+		if !de.Type().IsRegular() {
 			return nil
 		}
 		sum, stagedFile := sums[rel]
 		if !stagedFile {
 			if _, isLink := links[rel]; !isLink {
-				removed = append(removed, rel) // 盘上有而暂存区没有：随事务消失
+				d.removed = append(d.removed, rel) // 盘上有而暂存区没有：随事务消失
 			}
 			return nil
 		}
 		sameContent := false
-		if fi, ferr := d.Info(); ferr == nil && fi.Mode().IsRegular() && fi.Size() == sizes[rel] {
+		if fi, ferr := de.Info(); ferr == nil && fi.Mode().IsRegular() && fi.Size() == sizes[rel] {
 			h, herr := fileindex.SHA256File(path)
 			sameContent = herr == nil && h == sum
 		}
@@ -2489,8 +2578,9 @@ func diffForLanding(staged, lower string) (newFiles, removed, newLinks []string)
 		return nil
 	})
 	collectNew()
-	sort.Strings(removed)
-	return newFiles, removed, newLinks
+	sort.Strings(d.removed)
+	sort.Strings(d.removedDirs)
+	return d
 }
 
 func subtractStrings(have, want []string) []string {

@@ -1722,12 +1722,12 @@ func TestDiffForLandingLandsSymlinkSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFileT(t, filepath.Join(lower, "usr", "bin", "shim"), "was-regular")
-	newFiles, removed, newLinks := diffForLanding(staged, lower)
-	if len(newFiles) != 0 || len(removed) != 0 {
-		t.Errorf("类型替换不应进常规增删清单：new=%v removed=%v", newFiles, removed)
+	diff := diffForLanding(staged, lower)
+	if len(diff.newFiles) != 0 || len(diff.removed) != 0 {
+		t.Errorf("类型替换不应进常规增删清单：new=%v removed=%v", diff.newFiles, diff.removed)
 	}
-	if len(newLinks) != 1 || newLinks[0] != "usr/bin/shim" {
-		t.Errorf("symlink 替换常规文件应记为链接落盘：links=%v", newLinks)
+	if len(diff.newLinks) != 1 || diff.newLinks[0] != "usr/bin/shim" {
+		t.Errorf("symlink 替换常规文件应记为链接落盘：links=%v", diff.newLinks)
 	}
 }
 

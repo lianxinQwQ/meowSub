@@ -105,17 +105,23 @@ func quoteUnitArg(p string) string {
 }
 
 // Run 是 daemon-run 动词主体：预引导 autostart 组后阻塞服务 socket。
-// 仅接受 root。
-func Run(cfg *config.Config) error {
+// 仅接受 root。cfgPath 是正式配置路径：启动即载入校验（失败随单元重启
+// 暴露），此后每次引导前经 Server.reloadCfg 当场重读——daemon 存续期间
+// 改配置，下一拍引导即生效，无需重启守护进程。
+func Run(cfgPath string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("daemon-run 需要 root")
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
 	}
 	if st, serr := os.Stat(cfg.BaseDir); serr == nil {
 		if sysAny := st.Sys(); sysAny != nil {
 			fmt.Printf("[meowsubd] base_dir=%s（uid 鉴权以 root 为基线）\n", cfg.BaseDir)
 		}
 	}
-	s := NewServer(cfg)
+	s := NewServer(cfg, cfgPath)
 	cleanupLegacyOverlays() // 叠加层方案残留的一次性清退
 	go func() {             // autostart 组随服务启动依次引导
 		for _, g := range cfg.Groups {

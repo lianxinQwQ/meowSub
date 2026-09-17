@@ -809,3 +809,89 @@ func TestMountBootArgs(t *testing.T) {
 		t.Errorf("nil 配置应返回空: %v", got)
 	}
 }
+
+// TestBootPicksUpConfigChange 引导前当场重读配置：daemon 存续期间改写
+// 正式配置（新增 mounts），下一次 start 引导的 nspawn 参数即含新挂载
+// ——改配置无需重启守护进程。断言锚定具体挂载而非泛 --bind：会话直通
+// 的 --bind-ro 条目（X11 等）两拍都在且与本题无关。
+func TestBootPicksUpConfigChange(t *testing.T) {
+	base := t.TempDir()
+	cfgPath := filepath.Join(base, "meowsub.toml")
+	writeCfg := func(mounts string) {
+		body := "base_dir = \"" + base + "\"\n" + mounts +
+			"\n[code]\npackages = [\"git\"]\n"
+		if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(base, "build", "code", "usr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCfg("") // 初始配置：无 mounts
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingExec{}
+	s := NewServer(cfg, cfgPath)
+	s.Exec = rec.Exec
+
+	resp := s.Handle(context.Background(),
+		Request{Op: OpStart, Group: "code", CallerUID: 0})
+	if !resp.OK {
+		t.Fatalf("首次 start 失败: %+v", resp)
+	}
+	for _, c := range rec.callsSnapshot() {
+		if strings.HasPrefix(c, "systemd-nspawn") &&
+			strings.Contains(c, "--bind=/srv/share") {
+			t.Fatalf("初始配置无该挂载，引导不应携带: %v", c)
+		}
+	}
+
+	// 不重启守护进程，直接改写配置；换新 exec 簿记并按停机清簿记，
+	// 让下一次 start 走真实引导路径。
+	writeCfg("mounts = [\"/srv/share:/share\"]")
+	rec2 := &recordingExec{}
+	s.Exec = rec2.Exec
+	_ = s.poweroff("code")
+	resp = s.Handle(context.Background(),
+		Request{Op: OpStart, Group: "code", CallerUID: 0})
+	if !resp.OK {
+		t.Fatalf("二次 start 失败: %+v", resp)
+	}
+	found := false
+	for _, c := range rec2.callsSnapshot() {
+		if strings.HasPrefix(c, "systemd-nspawn") &&
+			strings.Contains(c, "--bind=/srv/share:/share") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("新引导应携带改后配置的挂载: %v", rec2.calls)
+	}
+}
+
+// TestBootRejectsBrokenConfig 配置被改坏后引导明确报错（含路径与原因），
+// 而非沿用旧快照静默引导。
+func TestBootRejectsBrokenConfig(t *testing.T) {
+	base := t.TempDir()
+	cfgPath := filepath.Join(base, "meowsub.toml")
+	body := "base_dir = \"" + base + "\"\n\n[code]\npackages = [\"git\"]\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(cfg, cfgPath)
+	s.Exec = (&recordingExec{}).Exec
+	if err := os.WriteFile(cfgPath, []byte("base_dir = 42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.Handle(context.Background(),
+		Request{Op: OpStart, Group: "code", CallerUID: 0})
+	if resp.OK || !strings.Contains(resp.Error, "重读配置") {
+		t.Fatalf("坏配置应拒绝引导并留原因: %+v", resp)
+	}
+}
