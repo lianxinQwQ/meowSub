@@ -234,14 +234,14 @@ func Ps() error {
 
 // LaunchAsRoot 无 daemon 时的 root 直连入口执行：确保实例与机器，解析目标
 // （二进制名优先、其次 .desktop 展开），随后 machinectl 前台提交。
-func LaunchAsRoot(baseDir, group, target string, args []string) error {
-	argv, err := launchTarget(baseDir, group, target, args)
+func LaunchAsRoot(cfg *config.Config, group, target string, args []string) error {
+	argv, err := launchTarget(cfg.BaseDir, group, target, args)
 	if err != nil {
 		return err
 	}
 	run := argv[0]
-	av := append([]string{"shell", "-q"}, graphical.EnvArgs(ForwardEnv())...)
-	av = append(av, MachineName(run), "--")
+	av := sessionShellArgv(cfg, run, 0, ForwardEnv(),
+		MachineName(run), []string{"-q"}, argv[1:])
 	c := exec.Command("machinectl", av...)
 	c.Stdout, c.Stderr, c.Stdin = os.Stdout, os.Stderr, os.Stdin
 	return c.Run()
@@ -249,14 +249,14 @@ func LaunchAsRoot(baseDir, group, target string, args []string) error {
 
 // LaunchDesktopAsRoot 无 daemon 时 run-desktop 的 root 直连：确保实例，
 // 按实例内路径或 ID 解析 .desktop 为 argv 后前台提交。
-func LaunchDesktopAsRoot(baseDir, group, target string, args []string) error {
-	p := pathsFor(baseDir)
+func LaunchDesktopAsRoot(cfg *config.Config, group, target string, args []string) error {
+	p := pathsFor(cfg.BaseDir)
 	run := pickRunLike(p, group)
-	if InstanceLocked(baseDir, run) {
+	if InstanceLocked(cfg.BaseDir, run) {
 		return fmt.Errorf("实例 %s 同步锁定中（build 收尾），稍后重试", run)
 	}
 	if _, ok := exists(p.Root(run)); !ok {
-		if err := p.Deploy(filepath.Join(baseDir, "build", group), run, true); err != nil {
+		if err := p.Deploy(filepath.Join(cfg.BaseDir, "build", group), run, true); err != nil {
 			return err
 		}
 	}
@@ -264,9 +264,9 @@ func LaunchDesktopAsRoot(baseDir, group, target string, args []string) error {
 	if err != nil {
 		return err
 	}
-	av := append([]string{"shell", "-q"}, graphical.EnvArgs(ForwardEnv())...)
-	av = append(av, MachineName(run), "--")
-	c := exec.Command("machinectl", append(av, argv...)...)
+	av := sessionShellArgv(cfg, run, 0, ForwardEnv(),
+		MachineName(run), []string{"-q"}, argv)
+	c := exec.Command("machinectl", av...)
 	c.Stdout, c.Stderr, c.Stdin = os.Stdout, os.Stderr, os.Stdin
 	return c.Run()
 }

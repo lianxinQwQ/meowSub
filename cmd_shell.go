@@ -134,11 +134,11 @@ func openCmd(args []string) error {
 		return err
 	}
 	if *detach {
-		go func() { _ = daemon.LaunchAsRoot(cfg.BaseDir, group, target, rest) }()
+		go func() { _ = daemon.LaunchAsRoot(cfg, group, target, rest) }()
 		fmt.Println("已提交到 " + group)
 		return nil
 	}
-	return daemon.LaunchAsRoot(cfg.BaseDir, group, target, rest)
+	return daemon.LaunchAsRoot(cfg, group, target, rest)
 }
 
 // runDesktopCmd 解析实例内 .desktop 的 Exec 行并在实例内启动应用。
@@ -172,10 +172,10 @@ func runDesktopCmd(args []string) error {
 	}
 	if *detach {
 		go func() {
-			_ = daemon.LaunchDesktopAsRoot(cfg.BaseDir, group, target, rest)
+			_ = daemon.LaunchDesktopAsRoot(cfg, group, target, rest)
 		}()
 		fmt.Println("已提交到 " + group)
 		return nil
 	}
-	return daemon.LaunchDesktopAsRoot(cfg.BaseDir, group, target, rest)
+	return daemon.LaunchDesktopAsRoot(cfg, group, target, rest)
 }

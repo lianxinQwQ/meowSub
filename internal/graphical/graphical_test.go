@@ -214,3 +214,20 @@ func TestEnvArgsNoFallbackGuesses(t *testing.T) {
 		t.Fatalf("无运行时目录时不应推导 dbus，got %v", got)
 	}
 }
+
+func TestEnvArgsWithoutDBus(t *testing.T) {
+	got := EnvArgsWithoutDBus(map[string]string{
+		"XDG_RUNTIME_DIR":          "/run/user/1000",
+		"WAYLAND_DISPLAY":          "wayland-1",
+		"DISPLAY":                  ":0",
+		"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+	})
+	want := []string{
+		"--setenv=XDG_RUNTIME_DIR=/run/user/1000",
+		"--setenv=WAYLAND_DISPLAY=wayland-1",
+		"--setenv=DISPLAY=:0",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}

@@ -455,7 +455,7 @@ func TestSessionConfigDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := cfg.Groups[0]
-	if g.SessionMode != "sockets" || g.SessionUser != "caller" || g.SessionAccess != "all" {
+	if g.SessionMode != SessionModeNative || g.SessionUser != "caller" || g.SessionAccess != "all" {
 		t.Fatalf("默认值不符: %+v", g)
 	}
 	if uid := g.SessionUID(4242); uid != 4242 {
@@ -466,7 +466,7 @@ func TestSessionConfigDefaults(t *testing.T) {
 	}
 }
 
-// TestSessionConfigOverrides 组级覆盖三种取值；uid 接受 TOML 整数与字符串。
+// TestSessionConfigOverrides 组级覆盖会话方案；uid 接受 TOML 整数与字符串。
 func TestSessionConfigOverrides(t *testing.T) {
 	cfg, err := Load(writeTmp(t, `
 base_dir = "/s"
@@ -495,6 +495,31 @@ session_access = "1000"
 	}
 	if code.SessionMode != "off" || code.SessionUser != "1000" || code.SessionAccess != "1000" {
 		t.Fatalf("code 覆盖不符: %+v", code)
+	}
+
+	isolatedCfg, err := Load(writeTmp(t, `
+base_dir = "/s"
+[gui]
+packages = ["gtk3"]
+session_mode = "isolated"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := isolatedCfg.Groups[0].SessionMode; got != SessionModeIsolated {
+		t.Fatalf("isolated 模式未解析: %q", got)
+	}
+	nativeCfg, err := Load(writeTmp(t, `
+base_dir = "/s"
+[gui]
+packages = ["gtk3"]
+session_mode = "native"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nativeCfg.Groups[0].SessionMode; got != SessionModeNative {
+		t.Fatalf("native 模式未解析: %q", got)
 	}
 	if uid := tool.SessionUID(0); uid != 1000 {
 		t.Fatalf("固定 uid 应覆盖 caller: %d", uid)

@@ -116,14 +116,19 @@ func (r *recordingExec) Exec(name string, args ...string) *exec.Cmd {
 	}
 }
 
-// TestSessionBootArgsModes 引导参数按 session_mode 分流：sockets 逐条目
-// 只读直递（符号链接不出现在 bind 参数里）、rw 整目录读写直挂、off 仅
-// X11。X11 恒为只读直绑。
+// TestSessionBootArgsModes 引导参数按 session_mode 分流：sockets/native
+// 逐条目只读直递（符号链接不出现在 bind 参数里）、isolated 排除 session
+// bus、rw 整目录读写直挂、off 仅 X11。X11 恒为只读直绑。
 func TestSessionBootArgsModes(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "keyring"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	bus, err := net.Listen("unix", filepath.Join(dir, "bus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Close()
 	li, err := net.Listen("unix", filepath.Join(dir, "wayland-1"))
 	if err != nil {
 		t.Fatal(err)
@@ -144,11 +149,27 @@ func TestSessionBootArgsModes(t *testing.T) {
 	sockets := sessionBootArgs(mk("sockets"), "code", scan)
 	wantSockets := []string{
 		"--bind-ro=/tmp/.X11-unix",
+		"--bind-ro=" + filepath.Join(dir, "bus") + ":" + filepath.Join(dir, "bus"),
 		"--bind-ro=" + filepath.Join(dir, "keyring") + ":" + filepath.Join(dir, "keyring"),
 		"--bind-ro=" + filepath.Join(dir, "wayland-1") + ":" + filepath.Join(dir, "wayland-1"),
 	}
 	if !slices.Equal(sockets, wantSockets) {
 		t.Fatalf("sockets 不符:\n got  %v\n want %v", sockets, wantSockets)
+	}
+
+	isolated := sessionBootArgs(mk(config.SessionModeIsolated), "code", scan)
+	wantIsolated := []string{
+		"--bind-ro=/tmp/.X11-unix",
+		"--bind-ro=" + filepath.Join(dir, "keyring") + ":" + filepath.Join(dir, "keyring"),
+		"--bind-ro=" + filepath.Join(dir, "wayland-1") + ":" + filepath.Join(dir, "wayland-1"),
+	}
+	if !slices.Equal(isolated, wantIsolated) {
+		t.Fatalf("isolated 不应直递 session bus:\n got  %v\n want %v", isolated, wantIsolated)
+	}
+
+	native := sessionBootArgs(mk(config.SessionModeNative), "code", scan)
+	if !slices.Equal(native, wantSockets) {
+		t.Fatalf("native 应保留 session bus:\n got  %v\n want %v", native, wantSockets)
 	}
 
 	rw := sessionBootArgs(mk("rw"), "code", scan)
@@ -160,6 +181,52 @@ func TestSessionBootArgsModes(t *testing.T) {
 	off := sessionBootArgs(mk("off"), "code", scan)
 	if !slices.Equal(off, []string{"--bind-ro=/tmp/.X11-unix"}) {
 		t.Fatalf("off 不符: %v", off)
+	}
+}
+
+func TestIsolatedSessionUsesPrivateBus(t *testing.T) {
+	cfg := &config.Config{Groups: []*config.Group{
+		{Name: "code", SessionMode: config.SessionModeIsolated},
+	}}
+	got := sessionShellArgv(cfg, "code", 1000, map[string]string{
+		"XDG_RUNTIME_DIR":          "/run/user/1000",
+		"WAYLAND_DISPLAY":          "wayland-1",
+		"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+	}, "ms-code", nil, []string{"/usr/bin/app", "--open"})
+	want := []string{
+		"shell", "--uid=1000",
+		"--setenv=XDG_RUNTIME_DIR=/run/user/1000",
+		"--setenv=WAYLAND_DISPLAY=wayland-1",
+		"--setenv=GTK_USE_PORTAL=0",
+		"--setenv=GIO_USE_VFS=local",
+		"ms-code", "/usr/bin/dbus-run-session", "--", "/usr/bin/app", "--open",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("isolated shell 参数不符:\n got  %v\n want %v", got, want)
+	}
+}
+
+func TestNativeSessionFiltersBusAndDisablesPortal(t *testing.T) {
+	cfg := &config.Config{Groups: []*config.Group{
+		{Name: "code", SessionMode: config.SessionModeNative},
+	}}
+	got := sessionShellArgv(cfg, "code", 1000, map[string]string{
+		"XDG_RUNTIME_DIR":          "/run/user/1000",
+		"WAYLAND_DISPLAY":          "wayland-1",
+		"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+	}, "ms-code", nil, []string{"/usr/bin/app"})
+	want := []string{
+		"shell", "--uid=1000",
+		"--setenv=XDG_RUNTIME_DIR=/run/user/1000",
+		"--setenv=WAYLAND_DISPLAY=wayland-1",
+		"--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+		"--setenv=GTK_USE_PORTAL=0",
+		"--setenv=GIO_USE_VFS=local",
+		"ms-code", "/bin/sh", "-c", nativeBusProxyScript,
+		"meowsub-dbus-proxy", "/usr/bin/app",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("native shell 参数不符:\n got  %v\n want %v", got, want)
 	}
 }
 

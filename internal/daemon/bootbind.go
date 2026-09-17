@@ -28,6 +28,9 @@ func sessionModeFor(cfg *config.Config, run string) string {
 	}
 	for _, g := range cfg.Groups {
 		if run == g.Name || strings.HasSuffix(run, "@"+g.Name) {
+			if g.SessionMode == "" {
+				return config.DefaultSessionMode
+			}
 			return g.SessionMode
 		}
 	}
@@ -101,14 +104,32 @@ func sessionBootArgs(cfg *config.Config, run string, scan []graphical.Bind) []st
 			// 不处理运行时目录
 		case mode == config.SessionModeRW:
 			args = append(args, "--bind="+b.Path)
-		default: // sockets
-			entries, _ := graphical.PlanDir(b.Path)
+		default: // sockets / isolated
+			entries, _ := sessionPlanDir(b.Path, mode)
 			for _, e := range entries {
 				args = append(args, "--bind-ro="+e.Host+":"+e.Container)
 			}
 		}
 	}
 	return args
+}
+
+// sessionPlanDir 按会话模式筛选宿主运行时目录中的直递条目。isolated
+// 仍需 Wayland/X11、PipeWire 等图形资源，但绝不能把宿主 session bus
+// 带进实例；否则实例内 portal 请求会落到宿主的文件选择器。
+func sessionPlanDir(hostDir, mode string) ([]graphical.Entry, []graphical.Link) {
+	entries, links := graphical.PlanDir(hostDir)
+	if mode != config.SessionModeIsolated {
+		return entries, links
+	}
+	filtered := entries[:0]
+	for _, e := range entries {
+		if e.Container == filepath.Join(hostDir, "bus") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered, links
 }
 
 // cleanupLegacyOverlays 一次性清退叠加层方案（已由套接字直递取代）在

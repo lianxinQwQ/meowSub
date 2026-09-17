@@ -80,8 +80,9 @@ var ExtraBasePackages = []string{"archlinuxcn-keyring", "paru"}
 
 // DefaultBasePackages 初始系统 pacstrap 的显式安装包，也是存量基础系统
 // 每轮 updateBase 的补全清单（--needed 幂等）：清单新增项不做一次性
-// 补装，随下一轮 build 自动传导。
-var DefaultBasePackages = []string{"base", "base-devel", "sudo", "git"}
+// 补装，随下一轮 build 自动传导。xdg-dbus-proxy 是 native 会话模式
+// 过滤宿主 session bus 的必需基础设施。
+var DefaultBasePackages = []string{"base", "base-devel", "sudo", "git", "xdg-dbus-proxy"}
 
 // ---- 内部结构 ----
 

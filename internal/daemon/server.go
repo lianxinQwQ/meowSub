@@ -246,7 +246,7 @@ func (s *Server) ensureSession(run string, uid int) {
 			}
 			// 宿主侧身份未变 ≠ 容器内视图可见：容器 logind 首个会话即给
 			// 运行时目录盖上私有 tmpfs，被遮蔽的条目在 mountinfo 里仍在。
-			entries, _ := graphical.PlanDir(b.Path)
+			entries, _ := sessionPlanDir(b.Path, mode)
 			var err error
 			lost, err = s.sessionViewLost(run, mode, b.Path, entries)
 			if err != nil {
@@ -415,7 +415,7 @@ func (s *Server) redeliverSession(run string, b graphical.Bind,
 		return c.Run()
 	}
 
-	entries, links := graphical.PlanDir(b.Path)
+	entries, links := sessionPlanDir(b.Path, mode)
 	paths := make([]string, len(entries))
 	for i, e := range entries {
 		paths[i] = e.Container
@@ -689,7 +689,8 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 		argv := append([]string{r.Cmd}, r.Args...)
 		var out bytes.Buffer
 		c := s.Exec("machinectl",
-			shellArgv(r.CallerUID, r.Env, MachineName(run), nil, argv)...)
+			sessionShellArgv(s.cfg(), run, r.CallerUID, r.Env,
+				MachineName(run), nil, argv)...)
 		c.Stdout = &out
 		c.Stderr = &out
 		rerr := c.Run()
@@ -717,7 +718,7 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 		s.ensureSession(run, s.sessionUIDFor(group, r.CallerUID))
 		var ebuf bytes.Buffer // machinectl 的报错只在 stderr，吞掉就成无声失败
 		c := s.Exec("machinectl",
-			shellArgv(s.sessionUIDFor(group, r.CallerUID), r.Env,
+			sessionShellArgv(s.cfg(), run, s.sessionUIDFor(group, r.CallerUID), r.Env,
 				MachineName(run), nil, argv)...)
 		c.Stdout = io.Discard
 		c.Stderr = &ebuf
@@ -751,7 +752,7 @@ func (s *Server) Handle(ctx context.Context, r Request) Response {
 		s.ensureSession(run, s.sessionUIDFor(group, r.CallerUID))
 		var ebuf bytes.Buffer // machinectl 的报错只在 stderr，吞掉就成无声失败
 		c := s.Exec("machinectl",
-			shellArgv(s.sessionUIDFor(group, r.CallerUID), r.Env,
+			sessionShellArgv(s.cfg(), run, s.sessionUIDFor(group, r.CallerUID), r.Env,
 				MachineName(run), nil, argv)...)
 		c.Stdout = io.Discard
 		c.Stderr = &ebuf
@@ -806,14 +807,87 @@ func armConnKill(c *exec.Cmd, ctx context.Context) (stop func()) {
 // 容器内命令。
 func shellArgv(uid int, env map[string]string, machine string,
 	opts, argv []string) []string {
+	return shellArgvWithBus(uid, env, machine, opts, argv, false, false, false)
+}
+
+// sessionShellArgv 是应用/交互 shell 的统一入口。isolated 模式只把图形
+// 会话套接字带入实例并启动私有 D-Bus；native 模式保留宿主 D-Bus，
+// 但两者都关闭 portal，避免文件选择请求落到宿主桌面。
+func sessionShellArgv(cfg *config.Config, run string, uid int,
+	env map[string]string, machine string, opts, argv []string) []string {
+	mode := sessionModeFor(cfg, run)
+	privateBus := mode == config.SessionModeIsolated
+	disablePortal := mode == config.SessionModeNative || privateBus
+	filterHostBus := mode == config.SessionModeNative
+	return shellArgvWithBus(uid, env, machine, opts, argv,
+		privateBus, disablePortal, filterHostBus)
+}
+
+func shellArgvWithBus(uid int, env map[string]string, machine string,
+	opts, argv []string, privateBus, disablePortal, filterHostBus bool) []string {
 	mach := append([]string{"shell"}, opts...)
 	if uid > 0 {
 		mach = append(mach, "--uid="+strconv.Itoa(uid))
 	}
-	mach = append(mach, graphical.EnvArgs(env)...)
+	if privateBus {
+		// dbus-run-session 会创建并注入新的 session bus；不要把调用者的
+		// 宿主地址传给它，避免应用启动早期仍误连宿主 bus。
+		mach = append(mach, graphical.EnvArgsWithoutDBus(env)...)
+	} else {
+		mach = append(mach, graphical.EnvArgs(env)...)
+	}
+	if disablePortal {
+		// GTK/Electron 在检测到 portal 后可能主动把文件选择请求交给
+		// 宿主桌面；native/isolated 都优先让实例内进程绘制 chooser。
+		mach = append(mach,
+			"--setenv=GTK_USE_PORTAL=0",
+			"--setenv=GIO_USE_VFS=local")
+	}
 	mach = append(mach, machine)
+	if privateBus {
+		argv = append([]string{"/usr/bin/dbus-run-session", "--"}, argv...)
+	} else if filterHostBus {
+		argv = append([]string{"/bin/sh", "-c", nativeBusProxyScript,
+			"meowsub-dbus-proxy"}, argv...)
+	}
 	return append(mach, argv...)
 }
+
+// nativeBusProxyScript 为 native 模式建立宿主 session bus 的受限视图：
+// 输入法服务可用，但 portal、FileManager1 与其它宿主桌面服务不可见。
+// 代理生命周期跟随应用/交互 shell，应用退出时一并清理。
+const nativeBusProxyScript = `set -eu
+proxy="$XDG_RUNTIME_DIR/.meowsub-bus-proxy-$$"
+cleanup() {
+  if [ -n "${proxy_pid:-}" ]; then
+    kill "$proxy_pid" 2>/dev/null || true
+  fi
+  rm -f "$proxy"
+}
+trap cleanup EXIT
+rm -f "$proxy"
+if [ ! -x /usr/bin/xdg-dbus-proxy ]; then
+  echo "meowsub: native 模式缺少 /usr/bin/xdg-dbus-proxy，暂时直连宿主 bus" >&2
+  exec "$@"
+fi
+/usr/bin/xdg-dbus-proxy "$DBUS_SESSION_BUS_ADDRESS" "$proxy" \
+  --filter \
+  --talk=org.fcitx.Fcitx5 \
+  --talk=org.fcitx.Fcitx \
+  --talk=org.freedesktop.IBus \
+  --talk=org.freedesktop.IBus.Panel \
+  --talk=org.freedesktop.portal.Fcitx \
+  --talk=org.freedesktop.portal.IBus &
+proxy_pid=$!
+for i in $(/usr/bin/seq 1 100); do
+  [ -S "$proxy" ] && break
+  kill -0 "$proxy_pid" 2>/dev/null || exit 1
+  /usr/bin/sleep 0.01
+done
+[ -S "$proxy" ] || exit 1
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$proxy"
+exec "$@"
+`
 
 // bridgeShell 交互 shell：以调用者身份在实例内拉起 bash，连接退化为本机
 // 终端与 machined 所配 pty 之间的字节管道。无登录环节——root 起 --uid
@@ -856,7 +930,7 @@ func (s *Server) bridgeShell(c *net.UnixConn, r Request) Response {
 	defer f.Close()
 	s.ensureSession(run, s.sessionUIDFor(group, r.CallerUID))
 	cmd := s.Exec("machinectl",
-		shellArgv(s.sessionUIDFor(group, r.CallerUID), r.Env,
+		sessionShellArgv(s.cfg(), run, s.sessionUIDFor(group, r.CallerUID), r.Env,
 			MachineName(run), opts, inner)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = f, f, f
 	if err := cmd.Start(); err != nil {

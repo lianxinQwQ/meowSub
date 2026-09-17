@@ -303,7 +303,7 @@ func TestExecuteFreshBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("state load: %v", err)
 	}
-	if st2.Base == nil || len(st2.Base.Packages) != 5 {
+	if st2.Base == nil || len(st2.Base.Packages) != 6 {
 		t.Errorf("base record = %+v", st2.Base)
 	}
 	if len(st2.Nodes) != 3 {

@@ -46,7 +46,11 @@ type Group struct {
 	// 引导该组实例并豁免零占用回收。
 	Autostart bool
 	// SessionMode 宿主会话直通方案（/run/user/<uid>）：
-	// sockets（默认）套接字/目录直递，容器内写入落私有目录；
+	// sockets 兼容模式：套接字/目录直递，容器内写入落私有目录；
+	// native 保留宿主 session bus（输入法等桌面服务可用），但关闭
+	// portal/GIO 远程文件选择路径，优先使用实例内原生 chooser；
+	// isolated 图形套接字直递但不直递宿主 session bus，应用由实例内
+	// dbus-run-session 建立私有用户总线；
 	// rw 整个运行时目录读写直挂（写入直达宿主，自担渗漏）；
 	// off 不处理。
 	SessionMode string
@@ -66,14 +70,17 @@ type Group struct {
 
 // 会话直通方案取值。
 const (
-	SessionModeSockets = "sockets"
-	SessionModeRW      = "rw"
-	SessionModeOff     = "off"
+	SessionModeSockets  = "sockets"
+	SessionModeNative   = "native"
+	SessionModeIsolated = "isolated"
+	SessionModeRW       = "rw"
+	SessionModeOff      = "off"
 )
 
-// 会话直通默认值（缺省键时由 Load 补齐）。
+// 会话直通默认值（缺省键时由 Load 补齐）。native 保留宿主输入法等
+// 必需桌面服务，同时避免实例默认调用宿主 portal。
 const (
-	DefaultSessionMode   = SessionModeSockets
+	DefaultSessionMode   = SessionModeNative
 	DefaultSessionUser   = "caller"
 	DefaultSessionAccess = "all"
 )
@@ -374,11 +381,11 @@ func Load(path string) (*Config, error) {
 				return nil, fmt.Errorf("软件组 [%s] 的 session_mode 必须是字符串", key)
 			}
 			switch s {
-			case SessionModeSockets, SessionModeRW, SessionModeOff:
+			case SessionModeSockets, SessionModeNative, SessionModeIsolated, SessionModeRW, SessionModeOff:
 				g.SessionMode = s
 			default:
 				return nil, fmt.Errorf("软件组 [%s] 的 session_mode %q 非法"+
-					"（sockets | rw | off）", key, s)
+					"（sockets | native | isolated | rw | off）", key, s)
 			}
 		}
 		if raw, has := table["session_user"]; has {

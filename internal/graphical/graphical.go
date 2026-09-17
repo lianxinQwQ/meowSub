@@ -152,11 +152,25 @@ func Binds() []string { return NspawnArgs(Scan()) }
 // 地址：仅当 XDG_RUNTIME_DIR 已透传时按客户端标准回退拼
 // unix:path=<runtime>/bus，只为照顾不实现该回退的客户端。
 func EnvArgs(env map[string]string) []string {
+	return envArgs(env, true)
+}
+
+// EnvArgsWithoutDBus 注入图形显示变量，但不注入或推导 session bus。
+// isolated 会话由实例内 dbus-run-session 创建临时私有 bus，不能让这里
+// 按 XDG_RUNTIME_DIR 回退到同路径的宿主 bus。
+func EnvArgsWithoutDBus(env map[string]string) []string {
+	return envArgs(env, false)
+}
+
+func envArgs(env map[string]string, withDBus bool) []string {
 	var args []string
 	for _, k := range []string{"XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY"} {
 		if v := env[k]; v != "" {
 			args = append(args, "--setenv="+k+"="+v)
 		}
+	}
+	if !withDBus {
+		return args
 	}
 	if db := env["DBUS_SESSION_BUS_ADDRESS"]; db != "" {
 		args = append(args, "--setenv=DBUS_SESSION_BUS_ADDRESS="+db)

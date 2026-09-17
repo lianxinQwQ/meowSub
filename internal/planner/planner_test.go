@@ -19,6 +19,15 @@ func cl(aur []string, pkgs ...string) *Closure {
 
 var testBase = []string{"base", "base-devel", "sudo", "git"}
 
+func TestDefaultBasePackagesIncludeDBusProxy(t *testing.T) {
+	for _, pkg := range DefaultBasePackages {
+		if pkg == "xdg-dbus-proxy" {
+			return
+		}
+	}
+	t.Fatalf("DefaultBasePackages = %v, want xdg-dbus-proxy", DefaultBasePackages)
+}
+
 // docFixture 复刻设计文档场景：tool/code/dev 三组。
 func docFixture() ([]string, map[string]*Closure) {
 	groups := []string{"code", "dev", "tool"} // 已排序
