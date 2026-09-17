@@ -1579,12 +1579,19 @@ type poolRepoEntry struct {
 }
 
 // filterBuiltTargets 按池内已收录版本过滤 AUR 构建目标：
-// 版本已知且池内有同版本产物 → 跳过；版本未知（解析期未取得上游版本）
-// 一律保守构建。返回仍需构建的目标与跳过数。
+// 版本已知且池内有同版本或更高版本产物 → 跳过；版本未知（解析期未取得
+// 上游版本）一律保守构建。返回仍需构建的目标与跳过数。
 func filterBuiltTargets(pkgs []string, wanted map[string]string, have poolVersions) (todo []string, skipped int) {
+	return filterBuiltTargetsBy(pkgs, wanted, have, hasPoolVersion)
+}
+
+// filterBuiltTargetsBy 是版本匹配器可注入的版本闸门。默认入口保留纯函数
+// 语义；实际构建路径使用 pacman 的 vercmp，以便把池内更高版本也视为已满足。
+func filterBuiltTargetsBy(pkgs []string, wanted map[string]string, have poolVersions,
+	hasVersion func([]string, string) bool) (todo []string, skipped int) {
 	for _, n := range pkgs {
 		want := wanted[n]
-		if want != "" && hasPoolVersion(have[n], want) {
+		if want != "" && hasVersion(have[n], want) {
 			skipped++
 			continue
 		}
@@ -1598,6 +1605,33 @@ func filterBuiltTargets(pkgs []string, wanted map[string]string, have poolVersio
 func hasPoolVersion(built []string, want string) bool {
 	for _, v := range built {
 		if v == want || isGitBuildOf(v, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// poolVersionAtLeast 按 Arch/libalpm 的版本规则判断池内产物是否不低于
+// AUR 元数据版本。AUR 的 Version 对 VCS 包可能只是 PKGBUILD 中的声明值，
+// 而 pkgver() 在实际构建时会生成另一条、更高的运行时版本；字符串相等或
+// 前缀判断会把这种已经更新的本地包误判为待构建。
+func poolVersionAtLeast(runner execx.Runner, built, want string) bool {
+	if built == want || isGitBuildOf(built, want) {
+		return true
+	}
+	out, err := runner.RunOutput("vercmp", built, want)
+	if err != nil {
+		return false
+	}
+	cmp, err := strconv.Atoi(strings.TrimSpace(out))
+	return err == nil && cmp >= 0
+}
+
+// hasPoolVersion 使用宿主机 pacman 提供的 vercmp；vercmp 失败时由
+// poolVersionAtLeast 保守返回 false，避免把不确定状态当成已满足。
+func (b *Builder) hasPoolVersion(built []string, want string) bool {
+	for _, v := range built {
+		if poolVersionAtLeast(b.Runner, v, want) {
 			return true
 		}
 	}
@@ -1869,7 +1903,7 @@ func promoteStale(skipped []string, wanted map[string]string, live map[string]st
 // --rebuild 强制重编（不受“已装即跳过”影响），makepkg 的 PKGDEST 把产物
 // 直接送入池；随后宿主机 repo-add 收录，并清掉车间里的叶子包保证下轮
 // 仍走同一条可复现路径。
-// 版本闸门：解析期拿到上游版本且池内已收录同版本产物的目标跳过；
+// 版本闸门：解析期拿到上游版本且池内已收录同版本或更高版本产物的目标跳过；
 // 跳过前再用实时 RPC 复核一遍上游版本，杜绝元数据滞后导致的漏追版；
 // 版本变化（或未知版本）的目标先从池仓库摘除登记、再进车间重编，
 // 保证它们始终以 AUR 分类走真实的 makepkg 流程。
@@ -1880,7 +1914,7 @@ func (b *Builder) buildAurPackages(a *reconcile.Action) error {
 	entries := b.poolRepoEntries()
 	have := poolVersionsFromEntries(entries)
 	fmt.Fprintf(b.Out, "[aur] 池内已收录 %d 个包的版本索引\n", len(have))
-	todo, _ := filterBuiltTargets(a.Pkgs, a.Versions, have)
+	todo, _ := filterBuiltTargetsBy(a.Pkgs, a.Versions, have, b.hasPoolVersion)
 	skippedNames := minusStrings(a.Pkgs, todo)
 	if len(skippedNames) > 0 {
 		if live, err := aurLiveVersions(skippedNames); err != nil {

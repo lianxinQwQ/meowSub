@@ -3,6 +3,8 @@ package builder
 import (
 	"reflect"
 	"testing"
+
+	"meowsub/internal/execx"
 )
 
 func TestParseRepoDesc(t *testing.T) {
@@ -81,6 +83,44 @@ func TestIsGitBuildOf(t *testing.T) {
 		if got := isGitBuildOf(c.built, c.want); got != c.ok {
 			t.Errorf("isGitBuildOf(%q, %q) = %v, 期望 %v", c.built, c.want, got, c.ok)
 		}
+	}
+}
+
+func TestPoolVersionAtLeastUsesArchVersionOrdering(t *testing.T) {
+	const built = "26.908.70816.r2122.g5f7310d7-1"
+	const want = "26.908.40834.r2114.g249cd4b6-1"
+	key := "vercmp " + built + " " + want
+	r := &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{
+		key: {Out: "1\n"},
+	}}
+
+	if !poolVersionAtLeast(r, built, want) {
+		t.Fatalf("池内更高版本应满足 AUR 版本: built=%q want=%q", built, want)
+	}
+
+	low := &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{
+		key: {Out: "-1\n"},
+	}}
+	if poolVersionAtLeast(low, built, want) {
+		t.Fatalf("低版本不应满足 AUR 版本: built=%q want=%q", built, want)
+	}
+}
+
+func TestFilterBuiltTargetsAcceptsNewerVCSArtifact(t *testing.T) {
+	const built = "26.908.70816.r2122.g5f7310d7-1"
+	const want = "26.908.40834.r2114.g249cd4b6-1"
+	r := &execx.RecordRunner{OutputFor: map[string]execx.OutputEntry{
+		"vercmp " + built + " " + want: {Out: "1\n"},
+	}}
+	b := New(r, nil, t.TempDir())
+	todo, skipped := filterBuiltTargetsBy(
+		[]string{"codex-desktop-git"},
+		map[string]string{"codex-desktop-git": want},
+		poolVersions{"codex-desktop-git": {built}},
+		b.hasPoolVersion,
+	)
+	if len(todo) != 0 || skipped != 1 {
+		t.Fatalf("已有更高 VCS 产物却未跳过: todo=%v skipped=%d", todo, skipped)
 	}
 }
 
